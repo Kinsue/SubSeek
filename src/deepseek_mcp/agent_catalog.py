@@ -252,19 +252,6 @@ def _doc_catalog(config: object) -> Mapping[str, AgentSpec]:
             return DEFAULT_CATALOG
 
 
-def refresh_tool_docstrings(config: object, functions: Iterable) -> None:
-    """Overwrite delegation docstrings with the config catalog; never raises.
-
-    A missing or broken config leaves the built-in-only docstrings in place.
-    """
-    catalog = _doc_catalog(config)
-    for function in functions:
-        description = getattr(function, "catalog_description", None)
-        if not isinstance(description, str) or not description:
-            description = "DeepSeek delegation sub-agent."
-        function.__doc__ = tool_docstring(description, catalog)
-
-
 def refresh_registered_tool_descriptions(
     mcp_server: Any, functions: Iterable, config: object = None
 ) -> None:
@@ -274,8 +261,8 @@ def refresh_registered_tool_descriptions(
     ``Tool`` object at registration, so mutating ``fn.__doc__`` afterwards never
     reaches hosts; this function updates ``tool.description`` instead. The
     private ``_tool_manager._tools`` layout is version-coupled: any missing
-    attribute silently degrades to the built-in descriptions rather than
-    crashing startup.
+    attribute or assignment failure silently degrades to the built-in
+    descriptions rather than crashing startup.
     """
     catalog = _doc_catalog(config)
     try:
@@ -285,11 +272,11 @@ def refresh_registered_tool_descriptions(
     for function in functions:
         try:
             tool = tools.get(getattr(function, "__name__", ""))
+            if tool is None:
+                continue
+            description = getattr(function, "catalog_description", None)
+            if not isinstance(description, str) or not description:
+                description = "DeepSeek delegation sub-agent."
+            tool.description = tool_docstring(description, catalog)
         except Exception:
             continue
-        if tool is None:
-            continue
-        description = getattr(function, "catalog_description", None)
-        if not isinstance(description, str) or not description:
-            description = "DeepSeek delegation sub-agent."
-        tool.description = tool_docstring(description, catalog)
