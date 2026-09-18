@@ -318,17 +318,19 @@ default (five hours plus 60 seconds).
 ### Budgets
 
 Six budget keys bound what one delegated run may consume. All are optional;
-defaults match the previous built-in limits, and each accepts `1` up to its
-hard maximum:
+defaults match the previous built-in limits, and each accepts any positive
+integer. There are no client-side hard caps — values beyond the active
+model's limits pass local validation and fail at the provider with a 4xx;
+the provider is the final authority.
 
-| key | default | hard max | bounds |
-|---|---|---|---|
-| `max_total_tokens_per_run` | 1,000,000 | 8,000,000 | tokens one run may consume (latest prompt + cumulative completion) |
-| `max_history_tokens` | 98,304 | 1,048,576 | conversation history sent to the provider, in tokens |
-| `max_output_tokens_per_request` | 16,384 | 65,536 | completion tokens per provider request |
-| `max_tool_calls_per_turn` | 32 | 256 | tool calls in one turn |
-| `max_tool_calls_per_run` | 128 | 1,024 | tool calls across one run |
-| `max_mutation_bytes_per_run` | 67,108,864 (64 MiB) | 1,073,741,824 (1 GiB) | bytes written through mutating tools |
+| key | default | bounds |
+|---|---|---|
+| `max_total_tokens_per_run` | 1,000,000 | tokens one run may consume (latest prompt + cumulative completion) |
+| `max_history_tokens` | 98,304 | conversation history sent to the provider, in tokens |
+| `max_output_tokens_per_request` | 16,384 | completion tokens per provider request |
+| `max_tool_calls_per_turn` | 32 | tool calls in one turn |
+| `max_tool_calls_per_run` | 128 | tool calls across one run |
+| `max_mutation_bytes_per_run` | 67,108,864 (64 MiB) | bytes written through mutating tools |
 
 Token accounting is usage-based: the run budget counts the provider-reported
 prompt tokens of the latest request plus cumulative completion tokens, so long
@@ -342,12 +344,14 @@ Cross-key rules: `max_output_tokens_per_request` must not exceed
 `max_total_tokens_per_run`, and `max_tool_calls_per_turn` must not exceed
 `max_tool_calls_per_run`.
 
+`max_input_token` and `max_output_token` are accepted as aliases for
+`max_history_tokens` and `max_output_tokens_per_request` respectively; an
+alias and its canonical key must not both be set.
+
 Each key can be overridden at runtime with a `DEEPSEEK_MAX_*` environment
 variable of the same name (for example `DEEPSEEK_MAX_TOOL_CALLS_PER_RUN=256`);
 an empty variable counts as unset, and the environment wins over the file.
-`max_turns` and `max_run_seconds` remain file-only. Values above the active
-model's context window are accepted here but fail at the provider with a 4xx —
-the provider stays the final authority.
+`max_turns` and `max_run_seconds` remain file-only.
 
 Budget errors are transparent: they report the used amount, the configured
 limit, and the config key involved; they reach the host agent instead of a

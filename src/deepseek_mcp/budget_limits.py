@@ -1,85 +1,80 @@
 """User-configurable run budgets shared by config loading and the agent loop.
 
-Each budget has a module-level default, an inclusive hard maximum, a config
-key in ``~/.deepseek-mcp/config.json``, and an environment variable override
+Each budget has a module-level default, a config key in
+``~/.deepseek-mcp/config.json``, and an environment variable override
 (environment wins over the file, mirroring ``DEEPSEEK_API_KEY`` semantics).
+There are no client-side hard maxima: the provider is the authority and rejects
+over-limit requests. Values only need to be positive integers, and cross-key
+consistency is still enforced so a smaller limit cannot exceed a larger one.
 """
 from __future__ import annotations
 
 import os
 
 DEFAULT_MAX_TOTAL_TOKENS_PER_RUN = 1_000_000
-HARD_MAX_TOTAL_TOKENS_PER_RUN = 8_000_000
 DEFAULT_MAX_HISTORY_TOKENS = 98_304
-HARD_MAX_HISTORY_TOKENS = 1_048_576
 DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST = 16_384
-HARD_MAX_OUTPUT_TOKENS_PER_REQUEST = 65_536
 DEFAULT_MAX_TOOL_CALLS_PER_TURN = 32
-HARD_MAX_TOOL_CALLS_PER_TURN = 256
 DEFAULT_MAX_TOOL_CALLS_PER_RUN = 128
-HARD_MAX_TOOL_CALLS_PER_RUN = 1_024
 DEFAULT_MAX_MUTATION_BYTES_PER_RUN = 64 * 1024 * 1024
-HARD_MAX_MUTATION_BYTES_PER_RUN = 1024 ** 3
-# (config key, environment variable, default, inclusive hard maximum)
+# (config key, environment variable, default)
 BUDGET_LIMIT_FIELDS = (
     (
         "max_total_tokens_per_run",
         "DEEPSEEK_MAX_TOTAL_TOKENS_PER_RUN",
         DEFAULT_MAX_TOTAL_TOKENS_PER_RUN,
-        HARD_MAX_TOTAL_TOKENS_PER_RUN,
     ),
     (
         "max_history_tokens",
         "DEEPSEEK_MAX_HISTORY_TOKENS",
         DEFAULT_MAX_HISTORY_TOKENS,
-        HARD_MAX_HISTORY_TOKENS,
     ),
     (
         "max_output_tokens_per_request",
         "DEEPSEEK_MAX_OUTPUT_TOKENS_PER_REQUEST",
         DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST,
-        HARD_MAX_OUTPUT_TOKENS_PER_REQUEST,
     ),
     (
         "max_tool_calls_per_turn",
         "DEEPSEEK_MAX_TOOL_CALLS_PER_TURN",
         DEFAULT_MAX_TOOL_CALLS_PER_TURN,
-        HARD_MAX_TOOL_CALLS_PER_TURN,
     ),
     (
         "max_tool_calls_per_run",
         "DEEPSEEK_MAX_TOOL_CALLS_PER_RUN",
         DEFAULT_MAX_TOOL_CALLS_PER_RUN,
-        HARD_MAX_TOOL_CALLS_PER_RUN,
     ),
     (
         "max_mutation_bytes_per_run",
         "DEEPSEEK_MAX_MUTATION_BYTES_PER_RUN",
         DEFAULT_MAX_MUTATION_BYTES_PER_RUN,
-        HARD_MAX_MUTATION_BYTES_PER_RUN,
     ),
 )
-BUDGET_CONFIG_KEYS = frozenset(key for key, _env, _default, _hard in BUDGET_LIMIT_FIELDS)
+# Owner-friendly alias -> canonical budget key (provider-axis naming).
+BUDGET_KEY_ALIASES = {
+    "max_input_token": "max_history_tokens",
+    "max_output_token": "max_output_tokens_per_request",
+}
+_ALIAS_BY_KEY = {target: alias for alias, target in BUDGET_KEY_ALIASES.items()}
+BUDGET_CONFIG_KEYS = frozenset(key for key, _env, _default in BUDGET_LIMIT_FIELDS)
 
 
-def validate_budget_limit(key: str, value: object, hard_max: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise RuntimeError(f"{key} must be an integer")
-    if not 1 <= value <= hard_max:
-        raise RuntimeError(f"{key} must be between 1 and {hard_max}")
+def validate_budget_limit(key: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RuntimeError(f"{key} must be a positive integer")
     return value
 
 
-def _load_optional_int_env(env_name: str, hard_max: int) -> int | None:
+def _load_optional_int_env(env_name: str) -> int | None:
     raw = os.getenv(env_name)
     if raw is None or not raw.strip():
         return None
     try:
         value = int(raw)
     except ValueError:
-        raise RuntimeError(f"{env_name} must be an integer") from None
-    if not 1 <= value <= hard_max:
-        raise RuntimeError(f"{env_name} must be between 1 and {hard_max}")
+        raise RuntimeError(f"{env_name} must be a positive integer") from None
+    if value < 1:
+        raise RuntimeError(f"{env_name} must be a positive integer")
     return value
 
 
@@ -96,13 +91,29 @@ def validate_budget_cross_limits(limits: dict) -> None:
         )
 
 
+def _file_budget_value(data: dict, key: str) -> tuple[object, bool]:
+    alias = _ALIAS_BY_KEY.get(key)
+    canonical_present = key in data
+    alias_present = alias is not None and alias in data
+    if canonical_present and alias_present:
+        raise RuntimeError(f"{key} and {alias} cannot both be set")
+    if canonical_present:
+        return data[key], True
+    if alias_present:
+        return data[alias], True
+    return None, False
+
+
 def load_budget_limits(data: dict) -> dict:
     limits: dict = {}
-    for key, env_name, default, hard_max in BUDGET_LIMIT_FIELDS:
-        env_value = _load_optional_int_env(env_name, hard_max)
+    for key, env_name, default in BUDGET_LIMIT_FIELDS:
+        value, present = _file_budget_value(data, key)
+        env_value = _load_optional_int_env(env_name)
         if env_value is not None:
             limits[key] = env_value
+        elif present:
+            limits[key] = validate_budget_limit(key, value)
         else:
-            limits[key] = validate_budget_limit(key, data.get(key, default), hard_max)
+            limits[key] = validate_budget_limit(key, default)
     validate_budget_cross_limits(limits)
     return limits

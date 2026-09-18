@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from . import windows_file_io
 from .budget_limits import (
     BUDGET_CONFIG_KEYS,
+    BUDGET_KEY_ALIASES,
     BUDGET_LIMIT_FIELDS,
     DEFAULT_MAX_HISTORY_TOKENS,
     DEFAULT_MAX_MUTATION_BYTES_PER_RUN,
@@ -36,7 +37,6 @@ REASONING_EFFORT_OPTIONS = ("none", "low", "high", "max")
 # Kept as the active-model default for internal/backward-compatible Config construction.
 DEFAULT_MODEL = DEFAULT_FLASH_MODEL
 DEFAULT_MAX_TURNS = 50
-MAX_TURNS = 100
 DEFAULT_MAX_RUN_SECONDS = 5 * 60 * 60
 HARD_MAX_RUN_SECONDS = 48 * 60 * 60
 DEFAULT_ALLOWED_TOOLS = [
@@ -67,7 +67,7 @@ CONFIG_KEYS = frozenset(
         "allowed_tools",
         "base_url",
     }
-) | BUDGET_CONFIG_KEYS
+) | BUDGET_CONFIG_KEYS | frozenset(BUDGET_KEY_ALIASES)
 logger = logging.getLogger(__name__)
 
 def _validate_private_directory(path: Path) -> None:
@@ -237,10 +237,8 @@ def _load_workspace(data: dict) -> Path:
 
 
 def _validate_max_turns(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise RuntimeError("max_turns must be an integer")
-    if not 1 <= value <= MAX_TURNS:
-        raise RuntimeError(f"max_turns must be between 1 and {MAX_TURNS}")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RuntimeError("max_turns must be a positive integer")
     return value
 
 
@@ -411,8 +409,8 @@ class Config:
 
     def _validate_budget_limits(self) -> None:
         limits: dict = {}
-        for key, _env_name, _default, hard_max in BUDGET_LIMIT_FIELDS:
-            value = validate_budget_limit(key, getattr(self, key), hard_max)
+        for key, _env_name, _default in BUDGET_LIMIT_FIELDS:
+            value = validate_budget_limit(key, getattr(self, key))
             setattr(self, key, value)
             limits[key] = value
         validate_budget_cross_limits(limits)
