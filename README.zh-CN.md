@@ -352,12 +352,49 @@ token 记账基于 provider 用量：运行预算按最近一次请求上报的 
 总 token 用量。标记 `(sync)` 的条目是进行中的同步委派：它们出现在清单
 里，但不接受按任务发送的消息。
 
-workspace 访问由租约约束：readonly 任务持共享跨进程租约——多个只读
-Agent（无论本进程还是其他进程）可并发分析同一 workspace；任何 coding
-任务需要独占租约，仅在无其他任务运行时准入；反之 coding 运行期间
-readonly 会被拒绝。存在待恢复的 mutation 事务时准入直接失败；任务
-运行期间配置的 workspace 发生变化时，新准入失败关闭直到池排空。
+workspace 访问按 workspace 分别受租约约束：readonly 任务持共享跨进程
+租约——多个只读 Agent（无论本进程还是其他进程）可并发分析同一
+workspace；coding 任务需要该 workspace 的独占租约，仅在没有其他任务
+指向同一 workspace 时准入。指向不同 workspace（例如 git worktree）的
+coding 任务可并行运行。存在待恢复的 mutation 事务时准入直接失败。
 共享租约仅支持 POSIX；Windows 上所有委派都持独占租约。
+
+#### Agent 目录
+
+Agent 即数据。四个委派工具都接受可选 `agent` 参数（空值选 API 内置
+默认：coding API 为 `coding`，只读 API 为 `readonly`）和可选
+`workspace` 参数（空值为配置默认），使任务可以直接指向另一个
+workspace 或 git worktree。
+
+自定义 Agent 通过 `agents` 配置键扩展内置项：
+
+```json
+"agents": [
+  {
+    "id": "reviewer",
+    "description": "Reviews changes without editing",
+    "capability": "readonly",
+    "model": "deepseek-v4-pro",
+    "allowed_tools": ["Read", "Glob", "Grep"]
+  }
+]
+```
+
+`id` 为小写 slug，`capability` 为 `coding` 或 `readonly`，
+`allowed_tools` 缺省取该能力的工具集；包含可变工具的 Agent 必须声明
+`coding` 能力。模型优先级：显式 `model` 参数 > Agent 的 model（仅当
+参数留在默认值时生效）> 配置默认。所选 Agent 的能力与 API 矛盾时
+会被拒绝，并指明 Agent、其能力与 API。
+
+#### Worktree
+
+`create_deepseek_worktree(name)` 在配置 workspace 的兄弟目录
+`<workspace>/../.subseek-worktrees/<name>` 创建分支为 `subseek/<name>`
+的 git worktree 并返回绝对路径。把该路径作为任务的 `workspace` 参数，
+即可让多个 coding Agent 在隔离树上并行；合并由宿主侧通过 git 完成。
+`remove_deepseek_worktree(name, force=False)` 移除 worktree（脏树未加
+`force` 时拒绝）并 prune。任何 DeepSeek 执行——无论本进程还是其他
+进程——正在该 worktree 上运行时，移除被拒绝。
 
 **工作区根目录**默认跟随启动宿主客户端时的当前目录。它是文件工具的路径边界，
 也是 coding Bash 的工作目录；对 `trusted_host` Bash 而言它不是操作系统级沙箱。

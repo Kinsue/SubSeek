@@ -206,9 +206,52 @@ def render_catalog_docstring(
     )
 
 
+MODEL_PRECEDENCE_LINE = (
+    "Model precedence: explicit model argument > agent model > config default "
+    "(an agent model applies only when the model argument is left at its default)."
+)
+
+
+def tool_docstring(
+    description: str, catalog: Mapping[str, AgentSpec] | None = None
+) -> str:
+    """Build one delegation-tool docstring with the catalog and precedence note."""
+    return (
+        f"{description}\n\nAgents:\n{render_catalog_docstring(catalog)}"
+        f"\n\n{MODEL_PRECEDENCE_LINE}"
+    )
+
+
 def register_agent_tool(
     mcp_tool: Any, annotations: Any, description: str, fn: Any
 ) -> Any:
     """Register an MCP tool with the catalog embedded in its docstring."""
-    fn.__doc__ = f"{description}\n\nAgents:\n{render_catalog_docstring()}"
+    fn.catalog_description = description
+    fn.__doc__ = tool_docstring(description)
     return mcp_tool(annotations=annotations)(fn)
+
+
+def refresh_tool_docstrings(config: object, functions: Iterable) -> None:
+    """Overwrite delegation docstrings with the config catalog; never raises.
+
+    A missing or broken config leaves the built-in-only docstrings in place.
+    """
+    if config is None:
+        try:
+            from .config import Config
+
+            config = Config.load()
+        except Exception:
+            config = None
+    try:
+        catalog = catalog_from_config(config)
+    except Exception:
+        try:
+            catalog = {agent.id: agent for agent in parse_agents(getattr(config, "agents", None))}
+        except Exception:
+            catalog = DEFAULT_CATALOG
+    for function in functions:
+        description = getattr(function, "catalog_description", None)
+        if not isinstance(description, str) or not description:
+            description = "DeepSeek delegation sub-agent."
+        function.__doc__ = tool_docstring(description, catalog)

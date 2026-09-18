@@ -30,6 +30,7 @@ from deepseek_mcp.job_manager import (
     JobError,
     JobRecord,
 )
+from deepseek_mcp.lease_registry import LeaseRegistry
 from deepseek_mcp.transaction_recovery import TransactionRecoveryError
 
 
@@ -985,6 +986,33 @@ class JobManagerTests(unittest.TestCase):
             self._assert_terminal(manager, job["job_id"])
 
         self.assertIsNone(self._mode(manager, config))
+
+    def test_registry_releases_new_lease_when_recovery_gate_fails(self) -> None:
+        registry = LeaseRegistry()
+        released: list[object] = []
+
+        def acquire_lease(config, shared=False):
+            return object()
+
+        def recovery_gate(config):
+            raise TransactionRecoveryError("unacknowledged transactions")
+
+        with self.assertRaises(TransactionRecoveryError):
+            registry.acquire(
+                "identity-1", object(), False, acquire_lease, recovery_gate,
+                released.append,
+            )
+
+        self.assertTrue(registry.is_idle())
+        self.assertEqual(registry.running_count("identity-1"), 0)
+        self.assertEqual(len(released), 1)
+
+        lease = registry.acquire(
+            "identity-1", object(), False, acquire_lease,
+            lambda config: None, released.append,
+        )
+        self.assertIsNotNone(lease)
+        self.assertEqual(registry.running_count("identity-1"), 1)
 
 
 if __name__ == "__main__":

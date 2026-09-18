@@ -373,15 +373,55 @@ age, and total tokens for finished jobs. Entries marked `(sync)` are
 in-flight synchronous delegations: they appear in listings but do not accept
 per-job messages.
 
-Workspace access is lease-governed: readonly jobs take a shared
-cross-process lease — multiple read-only agents, in this or another process,
-can analyze one workspace concurrently — while any coding job requires the
-exclusive lease and is admitted only when no other job is running;
-conversely, readonly jobs are rejected while a coding job runs. Admission
-also fails closed while pending mutation transactions await recovery, and if
-the configured workspace changes while jobs are running, new admissions
-fail closed until the pool drains. Shared leases are POSIX-only; on Windows
-every delegation takes the exclusive lease.
+Workspace access is lease-governed per workspace: readonly jobs take a
+shared cross-process lease — multiple read-only agents, in this or another
+process, can analyze one workspace concurrently — while a coding job
+requires that workspace's exclusive lease and is admitted only when no other
+job is running against the same workspace. Coding jobs on distinct
+workspaces (for example git worktrees) run in parallel. Admission also fails
+closed while pending mutation transactions await recovery. Shared leases are
+POSIX-only; on Windows every delegation takes the exclusive lease.
+
+#### Agent catalog
+
+Agents are data. The four delegation tools accept an optional `agent`
+argument (empty selects the API's built-in: `coding` for the coding APIs,
+`readonly` for the read-only APIs) and an optional `workspace` argument
+(empty selects the configured default) so a job can target another workspace
+— or a git worktree — directly.
+
+Custom agents extend the built-ins via the `agents` config key:
+
+```json
+"agents": [
+  {
+    "id": "reviewer",
+    "description": "Reviews changes without editing",
+    "capability": "readonly",
+    "model": "deepseek-v4-pro",
+    "allowed_tools": ["Read", "Glob", "Grep"]
+  }
+]
+```
+
+`id` is a lowercase slug, `capability` is `coding` or `readonly`,
+`allowed_tools` defaults to the capability's toolset, and an agent whose
+tools include mutation tools must declare `coding` capability. Model
+precedence: the explicit `model` tool argument wins, then the agent's model
+(applied only when the tool argument is left at its default), then the
+config default. Selecting an agent whose capability contradicts the API is
+rejected naming the agent, its capability, and the API.
+
+#### Worktrees
+
+`create_deepseek_worktree(name)` creates a git worktree of the configured
+workspace at `<workspace>/../.subseek-worktrees/<name>` on branch
+`subseek/<name>` and returns its absolute path. Pass that path as a job's
+`workspace` argument to run coding agents in parallel on isolated trees;
+merging stays a host-side git concern. `remove_deepseek_worktree(name,
+force=False)` removes the worktree (refusing dirty trees unless `force`) and
+prunes. Removal is refused while any DeepSeek execution — in this or another
+process — is running against that worktree.
 
 **Workspace root** auto-follows the directory where you launch the host client.
 To lock it to a fixed path regardless of cwd, add `"workspace": "/abs/path"`

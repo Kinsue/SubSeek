@@ -7,12 +7,19 @@ bounded, trimmed output.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
 
-from .execution_lock import WorkspaceLockError, workspace_identity
+from .execution_lock import (
+    WorkspaceLockBusy,
+    WorkspaceLockError,
+    acquire_workspace_lease,
+    workspace_identity,
+)
 from .safety import is_unsafe_workspace_root
 from .transaction_recovery import load_recovery_config
 
@@ -39,6 +46,22 @@ def worktree_path(workspace: Path, name: str) -> Path:
     if candidate == workspace or workspace in candidate.parents:
         raise WorktreeError("worktree path must not be inside the configured workspace")
     return candidate
+
+
+def _validate_worktree_root(root: Path) -> None:
+    """Refuse a pre-existing worktree parent that is not owned/private (0700)."""
+    if os.name == "nt":
+        return
+    try:
+        info = root.lstat()
+    except OSError as error:
+        raise WorktreeError(f"worktree directory is unavailable: {error}") from None
+    if not stat.S_ISDIR(info.st_mode) or root.is_symlink():
+        raise WorktreeError("worktree directory must be a real directory")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise WorktreeError(
+            "worktree directory must be owned by the current user with mode 0700"
+        )
 
 
 def _run_git(args: list[str], cwd: Path) -> str:
@@ -74,8 +97,16 @@ def create_worktree(name: object, manager: Any = None, config: Any = None) -> di
         workspace = active.workspace
         _require_git_repo(workspace)
         path = worktree_path(workspace, slug)
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if is_unsafe_workspace_root(path.parent):
+        root = path.parent
+        existed = root.exists()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not existed:
+            try:
+                os.chmod(root, 0o700)
+            except OSError:
+                pass
+        _validate_worktree_root(root)
+        if is_unsafe_workspace_root(root):
             raise WorktreeError(
                 "worktree directory is a protected or overly broad host path"
             )
@@ -110,12 +141,25 @@ def remove_worktree(
                 raise WorktreeError(
                     f"workspace is busy with a running DeepSeek job: {path}"
                 )
-        args = ["worktree", "remove"]
-        if force:
-            args.append("--force")
-        args.append(str(path))
-        _run_git(args, workspace)
-        _run_git(["worktree", "prune"], workspace)
+        lock_directory = getattr(manager, "_lock_directory", None)
+        try:
+            probe = acquire_workspace_lease(path, lock_directory, shared=False)
+        except WorkspaceLockBusy:
+            raise WorktreeError(
+                "worktree is in use by a running DeepSeek execution "
+                "(possibly in another process)"
+            ) from None
+        except WorkspaceLockError as error:
+            raise WorktreeError(f"worktree lease is unavailable: {error}") from None
+        try:
+            args = ["worktree", "remove"]
+            if force:
+                args.append("--force")
+            args.append(str(path))
+            _run_git(args, workspace)
+            _run_git(["worktree", "prune"], workspace)
+        finally:
+            probe.release()
         return {"ok": True, "path": str(path)}
     except WorktreeError as error:
         return {"ok": False, "error": str(error)}

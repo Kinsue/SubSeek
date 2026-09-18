@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import multiprocessing
+import os
 import shutil
 import subprocess
 import tempfile
@@ -9,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from deepseek_mcp.config import Config
+from deepseek_mcp.execution_lock import acquire_workspace_lease
 from deepseek_mcp.job_manager import DeepSeekJobManager
 from deepseek_mcp.worktrees import create_worktree, remove_worktree, worktree_path
 
@@ -21,6 +24,13 @@ def _result(message: str = "done") -> dict:
         "tool_calls": 0,
         "duration_seconds": 0.01,
     }
+
+
+def _hold_lease(workspace: str, lock_directory: str, ready, release) -> None:
+    lease = acquire_workspace_lease(Path(workspace), Path(lock_directory))
+    ready.set()
+    release.wait()
+    lease.release()
 
 
 class WorktreeTests(unittest.TestCase):
@@ -121,6 +131,46 @@ class WorktreeTests(unittest.TestCase):
         path = worktree_path(self.workspace, "job-five")
         self.assertEqual(path, (self.root / ".subseek-worktrees" / "job-five").resolve())
         self.assertFalse(path.is_relative_to(self.workspace))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX ownership and mode checks")
+    def test_preexisting_loose_worktree_root_is_refused(self) -> None:
+        loose = self.root / ".subseek-worktrees"
+        loose.mkdir(mode=0o755)
+
+        result = create_worktree("job-loose", config=self.config)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("0700", result["error"])
+
+    def test_remove_refuses_cross_process_lease_holder(self) -> None:
+        created = create_worktree("job-six", config=self.config)
+        path = Path(created["path"])
+        lock_directory = self.root / "locks"
+        manager = DeepSeekJobManager(lock_directory=lock_directory)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        release = context.Event()
+        process = context.Process(
+            target=_hold_lease,
+            args=(str(path), str(lock_directory), ready, release),
+        )
+        process.start()
+        try:
+            self.assertTrue(ready.wait(5.0), f"holder failed exit={process.exitcode}")
+            refused = remove_worktree("job-six", manager=manager, config=self.config)
+            self.assertFalse(refused["ok"])
+            self.assertIn("another process", refused["error"])
+        finally:
+            release.set()
+            process.join(5.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(5.0)
+
+        removed = remove_worktree(
+            "job-six", manager=manager, config=self.config, force=True
+        )
+        self.assertTrue(removed["ok"], removed)
 
 
 if __name__ == "__main__":
