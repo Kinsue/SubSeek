@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from deepseek_mcp.config import Config
+from deepseek_mcp import journal_schema
 from deepseek_mcp import transaction_journal as journal
 from deepseek_mcp.transaction_journal import TransactionJournalError
 
@@ -355,6 +356,7 @@ class TransactionJournalTests(unittest.TestCase):
             journal.append_warning(self.config, transaction_id, "x" * 4097)
         with (
             patch.object(journal, "MAX_RECORD_BYTES", 512),
+            patch.object(journal_schema, "MAX_RECORD_BYTES", 512),
             self.assertRaisesRegex(TransactionJournalError, "64 KiB"),
         ):
             journal.append_warning(self.config, transaction_id, "y" * 400)

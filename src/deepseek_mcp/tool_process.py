@@ -73,6 +73,9 @@ def _config_payload(config) -> dict:
         "base_url": config.base_url,
         "max_run_seconds": config.max_run_seconds,
         "delegation_capability": config.delegation_capability,
+        "active_agent": config.active_agent or config.delegation_capability,
+        "job_id": config.job_id,
+        "job_started_at": config.job_started_at,
         "expected_workspace_identity": config.expected_workspace_identity,
     }
 

@@ -29,10 +29,13 @@ from .budget_limits import (
     DEFAULT_MAX_TOOL_CALLS_PER_RUN,
     DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     DEFAULT_MAX_TOTAL_TOKENS_PER_RUN,
+    DEFAULT_SAME_WORKSPACE_WRITERS,
     load_budget_limits,
     load_optional_int_env,
+    load_same_workspace_writers,
     validate_budget_cross_limits,
     validate_budget_limit,
+    validate_same_workspace_writers,
 )
 from .child_runtime import ChildRuntimeError, runtime_is_within_workspace
 from .safety import is_unsafe_workspace_root
@@ -44,10 +47,8 @@ DEFAULT_PRO_MODEL = "deepseek-v4-pro"
 DEFAULT_REASONING_EFFORT = "high"
 PROVIDER_DEFAULT_REASONING_EFFORT = "provider-default"
 REASONING_EFFORT_OPTIONS = ("none", "low", "high", "max")
-# Kept as the active-model default for internal/backward-compatible Config construction.
 DEFAULT_MODEL = DEFAULT_FLASH_MODEL
-DEFAULT_MAX_TURNS = 50
-DEFAULT_MAX_PARALLEL_AGENTS = 16
+DEFAULT_MAX_TURNS = 50; DEFAULT_MAX_PARALLEL_AGENTS = 16
 DEFAULT_MAX_RUN_SECONDS = 5 * 60 * 60
 HARD_MAX_RUN_SECONDS = 48 * 60 * 60
 CONFIG_KEYS = frozenset(
@@ -66,6 +67,7 @@ CONFIG_KEYS = frozenset(
         "allowed_tools",
         "base_url",
         "agents",
+        "same_workspace_writers",
     }
 ) | BUDGET_CONFIG_KEYS | frozenset(BUDGET_KEY_ALIASES)
 logger = logging.getLogger(__name__)
@@ -395,10 +397,11 @@ class Config:
     max_tool_calls_per_run: int = DEFAULT_MAX_TOOL_CALLS_PER_RUN
     max_mutation_bytes_per_run: int = DEFAULT_MAX_MUTATION_BYTES_PER_RUN
     max_parallel_agents: int = DEFAULT_MAX_PARALLEL_AGENTS
-    # Validated agent catalog (built-ins plus user-defined agents).
     agents: tuple[AgentSpec, ...] = field(default_factory=lambda: BUILT_IN_AGENTS)
-    # Resolved agent id for the current per-call config (set by bind_agent).
     active_agent: str = ""
+    same_workspace_writers: str = DEFAULT_SAME_WORKSPACE_WRITERS  # allow|exclusive
+    job_id: str = field(default="", repr=False)
+    job_started_at: float | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if is_unsafe_workspace_root(self.workspace):
@@ -425,6 +428,7 @@ class Config:
             "max_parallel_agents", self.max_parallel_agents
         )
         self._validate_budget_limits()
+        self.same_workspace_writers = validate_same_workspace_writers(self.same_workspace_writers)
         if self.delegation_capability not in {"coding", "readonly"}:
             raise RuntimeError("invalid delegation capability")
         if self.delegation_capability == "readonly":
@@ -473,6 +477,7 @@ class Config:
             max_parallel_agents=_load_max_parallel_agents(data),
             allowed_tools=_load_allowed_tools(data),
             agents=parse_agents(data.get("agents")),
+            same_workspace_writers=load_same_workspace_writers(data),
             base_url=data.get("base_url", "https://api.deepseek.com"),
             flash_model=flash_model,
             pro_model=pro_model,

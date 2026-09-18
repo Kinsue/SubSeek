@@ -65,9 +65,16 @@ class ServerAnnotationTests(unittest.TestCase):
             "status": "committed",
             "warnings": [],
         }
+        snapshot = {
+            "pending": [record],
+            "count": 1,
+            "by_job": {
+                "unknown": {"status": "unknown", "count": 1, "records": [record]}
+            },
+        }
         with (
             patch.object(server, "load_recovery_config", return_value=config),
-            patch.object(server, "query_with_lease", return_value=[record]),
+            patch.object(server, "pending_snapshot", return_value=snapshot),
             patch.object(
                 server,
                 "acknowledge_with_lease",
@@ -81,6 +88,7 @@ class ServerAnnotationTests(unittest.TestCase):
             )
 
         self.assertEqual(queried["pending"], [record])
+        self.assertEqual(queried["by_job"]["unknown"]["status"], "unknown")
         self.assertEqual(acknowledged["acknowledged"], ["a" * 32])
         provider_load.assert_not_called()
 

@@ -45,7 +45,7 @@ from .private_logging import PrivateBoundedLogStream
 from .process_hardening import disable_core_dumps
 from .transaction_recovery import (
     TransactionRecoveryError, acknowledge_with_lease,
-    load_recovery_config, query_with_lease,
+    load_recovery_config, pending_snapshot,
 )
 from .worktrees import build_tools as build_worktree_tools
 
@@ -195,19 +195,19 @@ def ping() -> str:
 
 @mcp.tool(annotations=_RESULT_WITH_BOOKKEEPING)
 def get_deepseek_recovery() -> str:
-    """List durable, unacknowledged workspace mutation outcomes."""
+    """List durable, unacknowledged workspace mutation outcomes by job."""
     try:
-        records = query_with_lease(load_recovery_config())
+        payload = pending_snapshot(load_recovery_config(), job_manager.job_status)
     except (RuntimeError, TransactionRecoveryError) as error:
         return _json({"ok": False, "error": str(error)})
-    return _json({"ok": True, "pending": records, "count": len(records)})
+    return _json({"ok": True, **payload})
 
 @mcp.tool(annotations=_RECOVERY_ACK)
 def acknowledge_deepseek_mutations(transaction_ids: list[str]) -> str:
     """Acknowledge exact transaction IDs after the host verifies their files."""
     try:
         removed, pending = acknowledge_with_lease(
-            load_recovery_config(), transaction_ids
+            load_recovery_config(), transaction_ids, status_resolver=job_manager.job_status
         )
     except (RuntimeError, TransactionRecoveryError) as error:
         return _json({"ok": False, "error": str(error)})

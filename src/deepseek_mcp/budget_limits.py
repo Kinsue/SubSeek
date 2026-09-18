@@ -117,3 +117,28 @@ def load_budget_limits(data: dict) -> dict:
             limits[key] = validate_budget_limit(key, default)
     validate_budget_cross_limits(limits)
     return limits
+
+
+SAME_WORKSPACE_WRITERS_ENV = "DEEPSEEK_SAME_WORKSPACE_WRITERS"
+SAME_WORKSPACE_WRITERS_ALLOW = "allow"
+SAME_WORKSPACE_WRITERS_EXCLUSIVE = "exclusive"
+DEFAULT_SAME_WORKSPACE_WRITERS = SAME_WORKSPACE_WRITERS_ALLOW
+SAME_WORKSPACE_WRITERS_OPTIONS = (
+    SAME_WORKSPACE_WRITERS_ALLOW,
+    SAME_WORKSPACE_WRITERS_EXCLUSIVE,
+)
+
+
+def validate_same_workspace_writers(value: object) -> str:
+    if not isinstance(value, str) or value not in SAME_WORKSPACE_WRITERS_OPTIONS:
+        options = ", ".join(SAME_WORKSPACE_WRITERS_OPTIONS)
+        raise RuntimeError(f"same_workspace_writers must be one of: {options}")
+    return value
+
+
+def load_same_workspace_writers(data: dict) -> str:
+    """Resolve the same-workspace writer mode (env wins; empty env is unset)."""
+    raw = os.getenv(SAME_WORKSPACE_WRITERS_ENV)
+    if raw is None or not raw.strip():
+        raw = data.get("same_workspace_writers", DEFAULT_SAME_WORKSPACE_WRITERS)
+    return validate_same_workspace_writers(raw)

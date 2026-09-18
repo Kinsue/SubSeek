@@ -84,6 +84,7 @@ def row_from_job(job: object) -> dict[str, Any]:
         "capability": getattr(job, "capability", "coding"),
         "agent": _agent_of(job),
         "workspace": _workspace_of(job),
+        "workspace_identity": getattr(job, "workspace_identity", ""),
         "task_preview": _preview_of(job),
         "created_at": getattr(job, "created_at", 0.0) or 0.0,
         "started_at": getattr(job, "started_at", None),
@@ -169,6 +170,9 @@ def _age_seconds(now: float, started_at: object) -> str:
 def _format_row(row: dict[str, Any], now: float) -> str:
     total = row["tokens_total"]
     token_text = f"tokens={total}" if total is not None else "-"
+    pending = row.get("pending_recovery")
+    if isinstance(pending, int) and pending:
+        token_text += f" pending={pending}"
     marker = " (sync)" if row.get("sync") else ""
     return (
         f"{row['job_id']}{marker} | {row['status']} | {row['capability']} | "

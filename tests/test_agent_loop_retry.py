@@ -968,6 +968,34 @@ class RetryPolicyTests(unittest.TestCase):
 
         request.assert_not_called()
 
+    def test_coding_prompt_contains_concurrency_advisory_only_for_coding(self) -> None:
+        from deepseek_mcp.agent_loop import (
+            CONCURRENCY_ADVISORY,
+            _AgentControls,
+            _create_agent_state,
+        )
+
+        controls = _AgentControls(None, None, None)
+        coding = _create_agent_state("task", _config(), [], controls, None)
+        readonly = _create_agent_state(
+            "task",
+            Config(
+                api_key="sk-test",
+                workspace=Path.cwd(),
+                allowed_tools=["Read"],
+                delegation_capability="readonly",
+            ),
+            [],
+            controls,
+            None,
+        )
+
+        self.assertIn("concurrently", coding.messages[0]["content"])
+        self.assertIn(
+            CONCURRENCY_ADVISORY.splitlines()[0], coding.messages[0]["content"]
+        )
+        self.assertNotIn("concurrently", readonly.messages[0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

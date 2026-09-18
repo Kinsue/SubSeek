@@ -352,12 +352,21 @@ token 记账基于 provider 用量：运行预算按最近一次请求上报的 
 总 token 用量。标记 `(sync)` 的条目是进行中的同步委派：它们出现在清单
 里，但不接受按任务发送的消息。
 
-workspace 访问按 workspace 分别受租约约束：readonly 任务持共享跨进程
-租约——多个只读 Agent（无论本进程还是其他进程）可并发分析同一
-workspace；coding 任务需要该 workspace 的独占租约，仅在没有其他任务
-指向同一 workspace 时准入。指向不同 workspace（例如 git worktree）的
-coding 任务可并行运行。存在待恢复的 mutation 事务时准入直接失败。
-共享租约仅支持 POSIX；Windows 上所有委派都持独占租约。
+workspace 访问按 workspace 分别受租约约束。默认
+（`same_workspace_writers: "allow"`）下所有任务——包括 coding——都持共享
+跨进程租约，多个 Agent（无论本进程还是其他进程）可在同一 workspace 上
+并发工作：即主流模型。安全性来自提示词避让（coding agent 被要求把修改
+限制在任务范围内、编辑冲突时重读重试）、按 job 的 mutation 归属，以及
+git。设置 `same_workspace_writers: "exclusive"` 可恢复严格单写者语义：
+coding 任务需要该 workspace 的独占租约，仅在没有其他任务指向同一
+workspace 时准入，且准入受待恢复 mutation 门禁约束。worktree 仍是并行
+写者的保证隔离路径。共享租约仅支持 POSIX；Windows 上所有委派都持独占
+租约。
+
+mutation 日志携带按 job 的归属：`get_deepseek_recovery` 按任务分组待
+处理记录并标注各任务当前状态（拒绝确认仍在运行任务的记录）；准入响应
+与 `list_deepseek_jobs` 显示待恢复计数；96 条以上出现告警。allow 模式
+下宿主应及时确认。
 
 #### Agent 目录
 

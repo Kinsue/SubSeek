@@ -66,6 +66,11 @@ Rules:
    and document them in your final message.
 6. If a tool returns "ERROR: ...", read the error and decide: retry with fixed input,
    skip the file, or report and stop. Don't blindly loop on the same error.
+{advisory}"""
+
+CONCURRENCY_ADVISORY = """7. Other agents may edit this workspace concurrently. Scope edits to your task.
+   If an Edit fails its expected-identity check because the file changed underneath,
+   re-read the file and re-apply your change; never force or loop blindly.
 """
 
 
@@ -150,6 +155,11 @@ def _create_agent_state(
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         tools=", ".join(config.allowed_tools),
         workspace=config.workspace,
+        advisory=(
+            CONCURRENCY_ADVISORY
+            if config.delegation_capability == "coding"
+            else ""
+        ),
     )
     started = time.time()
     resource_budget = ResourceBudget(

@@ -692,6 +692,7 @@ class ToolProcessTests(unittest.TestCase):
                 )
 
                 manager = DeepSeekJobManager(lock_directory=lock_directory)
+                config.same_workspace_writers = "exclusive"
                 with patch("deepseek_mcp.job_manager.run_agent") as run_agent:
                     with self.assertRaisesRegex(JobError, "unacknowledged"):
                         manager.run_sync("must remain blocked", config)

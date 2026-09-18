@@ -163,7 +163,11 @@ def _persist_mutation_ready(
     config, transaction_id: str, name: str, arguments: dict, digest: bytes,
 ) -> None:
     try:
-        record_intent(config, transaction_id, name, arguments, digest)
+        record_intent(
+            config, transaction_id, name, arguments, digest,
+            job_id=config.job_id, agent=config.active_agent,
+            started_at=config.job_started_at,
+        )
     except JournalUpdatePublishedWarning:
         _write_mutation_ready(digest)
         raise

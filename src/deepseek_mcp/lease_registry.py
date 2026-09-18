@@ -49,21 +49,23 @@ class LeaseRegistry:
         config: Any,
         shared: bool,
         acquire_lease: Callable[..., WorkspaceExecutionLease],
-        recovery_check: Callable[[Any], None],
+        recovery_check: Callable[[Any], None] | None,
         release_lease: Callable[[WorkspaceExecutionLease], None],
     ) -> WorkspaceExecutionLease:
         """Admit one job for ``identity``, running the recovery gate each time."""
         entry = self._entries.get(identity)
         if entry is not None:
-            recovery_check(config)
+            if recovery_check is not None:
+                recovery_check(config)
             entry.count += 1
             return entry.lease
         lease = acquire_lease(config, shared)
-        try:
-            recovery_check(config)
-        except BaseException:
-            release_lease(lease)
-            raise
+        if recovery_check is not None:
+            try:
+                recovery_check(config)
+            except BaseException:
+                release_lease(lease)
+                raise
         mode = LEASE_SHARED if shared else LEASE_EXCLUSIVE
         self._entries[identity] = _Entry(lease, mode)
         return lease

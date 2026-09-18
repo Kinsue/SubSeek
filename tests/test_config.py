@@ -251,6 +251,52 @@ class ConfigTests(unittest.TestCase):
                         "credential",
                     )
 
+    def test_same_workspace_writers_default_override_and_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            self.assertEqual(
+                Config("credential", workspace).same_workspace_writers, "allow"
+            )
+            loaded = Config._from_data(
+                {
+                    "workspace": str(workspace),
+                    "allowed_tools": ["Read"],
+                    "same_workspace_writers": "exclusive",
+                },
+                "credential",
+            )
+            self.assertEqual(loaded.same_workspace_writers, "exclusive")
+            with patch.dict(
+                os.environ,
+                {"DEEPSEEK_SAME_WORKSPACE_WRITERS": "exclusive"},
+                clear=True,
+            ):
+                env_loaded = Config._from_data(
+                    {
+                        "workspace": str(workspace),
+                        "allowed_tools": ["Read"],
+                        "same_workspace_writers": "allow",
+                    },
+                    "credential",
+                )
+            self.assertEqual(env_loaded.same_workspace_writers, "exclusive")
+            with patch.dict(
+                os.environ, {"DEEPSEEK_SAME_WORKSPACE_WRITERS": "  "}, clear=True
+            ):
+                unset = Config._from_data(
+                    {"workspace": str(workspace), "allowed_tools": ["Read"]},
+                    "credential",
+                )
+            self.assertEqual(unset.same_workspace_writers, "allow")
+            for bad in ("nope", "", 3):
+                with self.subTest(bad=bad):
+                    with self.assertRaisesRegex(RuntimeError, "allow.*exclusive"):
+                        Config(
+                            "credential",
+                            workspace,
+                            same_workspace_writers=bad,  # type: ignore[arg-type]
+                        )
+
     def test_agents_catalog_is_validated_and_parsed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             loaded = Config._from_data(

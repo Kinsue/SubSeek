@@ -373,14 +373,25 @@ age, and total tokens for finished jobs. Entries marked `(sync)` are
 in-flight synchronous delegations: they appear in listings but do not accept
 per-job messages.
 
-Workspace access is lease-governed per workspace: readonly jobs take a
-shared cross-process lease — multiple read-only agents, in this or another
-process, can analyze one workspace concurrently — while a coding job
-requires that workspace's exclusive lease and is admitted only when no other
-job is running against the same workspace. Coding jobs on distinct
-workspaces (for example git worktrees) run in parallel. Admission also fails
-closed while pending mutation transactions await recovery. Shared leases are
-POSIX-only; on Windows every delegation takes the exclusive lease.
+Workspace access is lease-governed per workspace. By default
+(`same_workspace_writers: "allow"`) every job — coding included — takes a
+shared cross-process lease, so multiple agents, in this or another process,
+can work on one workspace concurrently: the mainstream model. Safety comes
+from advisory prompts (the coding agent is told to scope edits to its task
+and to re-read and re-apply when an edit conflicts with another writer),
+per-job mutation attribution, and git. Set `same_workspace_writers:
+"exclusive"` to restore strict single-writer semantics: a coding job then
+requires the workspace's exclusive lease, is admitted only when no other
+job runs against that workspace, and admissions are gated on pending
+mutation recovery. Worktrees remain the guaranteed-isolation path for
+parallel writers. Shared leases are POSIX-only; on Windows every delegation
+takes the exclusive lease.
+
+Mutation journaling carries per-job attribution: `get_deepseek_recovery`
+groups pending records by job with each job's current status (acknowledging
+a still-running job's records is refused), admission responses and
+`list_deepseek_jobs` surface pending-recovery counts, and a warning appears
+at 96+ pending records. Acknowledge promptly in allow mode.
 
 #### Agent catalog
 
