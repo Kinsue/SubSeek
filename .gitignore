@@ -22,6 +22,9 @@ env/
 # OS
 .DS_Store
 
+# Deepwork state
+.slim/deepwork/
+
 # Project
 ~/.deepseek-mcp/      # 配置文件不入 git
 .deepseek-mcp/
