@@ -9,8 +9,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .child_runtime import ChildRuntimeError, runtime_is_within_workspace
 from . import windows_file_io
+from .budget_limits import (
+    BUDGET_CONFIG_KEYS,
+    BUDGET_LIMIT_FIELDS,
+    DEFAULT_MAX_HISTORY_TOKENS,
+    DEFAULT_MAX_MUTATION_BYTES_PER_RUN,
+    DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST,
+    DEFAULT_MAX_TOOL_CALLS_PER_RUN,
+    DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+    DEFAULT_MAX_TOTAL_TOKENS_PER_RUN,
+    load_budget_limits,
+    validate_budget_limit,
+)
+from .child_runtime import ChildRuntimeError, runtime_is_within_workspace
 from .safety import is_unsafe_workspace_root
 from .workspace_guard import configure_workspace_identity
 CONFIG_PATH = Path.home() / ".deepseek-mcp" / "config.json"
@@ -54,7 +66,7 @@ CONFIG_KEYS = frozenset(
         "allowed_tools",
         "base_url",
     }
-)
+) | BUDGET_CONFIG_KEYS
 logger = logging.getLogger(__name__)
 
 def _validate_private_directory(path: Path) -> None:
@@ -363,6 +375,12 @@ class Config:
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     flash_reasoning_effort: str = DEFAULT_REASONING_EFFORT
     pro_reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    max_total_tokens_per_run: int = DEFAULT_MAX_TOTAL_TOKENS_PER_RUN
+    max_history_tokens: int = DEFAULT_MAX_HISTORY_TOKENS
+    max_output_tokens_per_request: int = DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST
+    max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN
+    max_tool_calls_per_run: int = DEFAULT_MAX_TOOL_CALLS_PER_RUN
+    max_mutation_bytes_per_run: int = DEFAULT_MAX_MUTATION_BYTES_PER_RUN
 
     def __post_init__(self) -> None:
         if is_unsafe_workspace_root(self.workspace):
@@ -385,9 +403,18 @@ class Config:
         self.base_url = _validate_base_url(self.base_url)
         self.max_turns = _validate_max_turns(self.max_turns)
         self.max_run_seconds = _validate_max_run_seconds(self.max_run_seconds)
+        self._validate_budget_limits()
         if self.delegation_capability not in {"coding", "readonly"}:
             raise RuntimeError("invalid delegation capability")
         self._validate_mutation_runtime()
+
+    def _validate_budget_limits(self) -> None:
+        for key, _env_name, _default, hard_max in BUDGET_LIMIT_FIELDS:
+            setattr(
+                self,
+                key,
+                validate_budget_limit(key, getattr(self, key), hard_max),
+            )
 
     def _validate_mutation_runtime(self) -> None:
         if not MUTATION_TOOLS.intersection(self.allowed_tools):
@@ -406,6 +433,7 @@ class Config:
     def _from_data(cls, data: dict, credential: str) -> "Config":
         flash_model, pro_model = _load_model_slots(data)
         flash_effort, pro_effort = _load_reasoning_efforts(data)
+        budget_limits = load_budget_limits(data)
         return cls(
             credential,
             workspace=_load_workspace(data),
@@ -421,6 +449,7 @@ class Config:
             reasoning_effort=flash_effort,
             flash_reasoning_effort=flash_effort,
             pro_reasoning_effort=pro_effort,
+            **budget_limits,
         )
 
     @classmethod

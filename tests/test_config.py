@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from deepseek_mcp.config import (
+    BUDGET_LIMIT_FIELDS,
     Config,
     DEFAULT_ALLOWED_TOOLS,
     DEFAULT_MAX_RUN_SECONDS,
@@ -340,6 +342,117 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(RuntimeError, "non-empty"):
                 _load_workspace({"workspace": ""})
+
+
+class BudgetConfigTests(unittest.TestCase):
+    def test_budget_defaults_and_valid_file_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            for key, _env_name, default, hard_max in BUDGET_LIMIT_FIELDS:
+                with self.subTest(key=key):
+                    config = Config(
+                        "credential", workspace, allowed_tools=["Read"]
+                    )
+                    self.assertEqual(getattr(config, key), default)
+                    loaded_default = Config._from_data(
+                        {"workspace": str(workspace)}, "credential"
+                    )
+                    self.assertEqual(getattr(loaded_default, key), default)
+                    loaded = Config._from_data(
+                        {"workspace": str(workspace), key: hard_max},
+                        "credential",
+                    )
+                    self.assertEqual(getattr(loaded, key), hard_max)
+
+    def test_budget_values_reject_bool_zero_and_hard_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            for key, _env_name, _default, hard_max in BUDGET_LIMIT_FIELDS:
+                for value in (True, 0, -1, "1", hard_max + 1):
+                    with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                        RuntimeError, key
+                    ):
+                        Config(
+                            "credential",
+                            workspace,
+                            allowed_tools=["Read"],
+                            **{key: value},  # type: ignore[arg-type]
+                        )
+
+    def test_budget_env_override_wins_over_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            for key, env_name, _default, _hard_max in BUDGET_LIMIT_FIELDS:
+                with self.subTest(key=key):
+                    with patch.dict(os.environ, {env_name: "2"}, clear=True):
+                        loaded = Config._from_data(
+                            {"workspace": str(workspace), key: 1},
+                            "credential",
+                        )
+                    self.assertEqual(getattr(loaded, key), 2)
+
+    def test_budget_invalid_env_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            for key, env_name, _default, hard_max in BUDGET_LIMIT_FIELDS:
+                for raw in ("not-an-int", "0", str(hard_max + 1)):
+                    with self.subTest(key=key, raw=raw):
+                        with (
+                            patch.dict(os.environ, {env_name: raw}, clear=True),
+                            self.assertRaisesRegex(RuntimeError, env_name),
+                        ):
+                            Config._from_data(
+                                {"workspace": str(workspace)}, "credential"
+                            )
+
+    def test_budget_file_values_round_trip_through_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir) / "config"
+            directory.mkdir(mode=0o700)
+            path = directory / "config.json"
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            payload: dict = {"allowed_tools": ["Read"]}
+            expected: dict = {}
+            for key, _env_name, default, _hard_max in BUDGET_LIMIT_FIELDS:
+                payload[key] = default + 1
+                expected[key] = default + 1
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+            with (
+                patch("deepseek_mcp.config.CONFIG_PATH", path),
+                patch(
+                    "deepseek_mcp.config._load_workspace",
+                    return_value=workspace,
+                ),
+                patch("deepseek_mcp.config._load_api_key", return_value="credential"),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                config = Config.load()
+            for key, value in expected.items():
+                self.assertEqual(getattr(config, key), value)
+
+    def test_budget_keys_are_accepted_and_unknown_keys_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir) / "config"
+            directory.mkdir(mode=0o700)
+            path = directory / "config.json"
+            accepted = {
+                key: default for key, _env, default, _hard in BUDGET_LIMIT_FIELDS
+            }
+            path.write_text(json.dumps(accepted), encoding="utf-8")
+            path.chmod(0o600)
+            with patch("deepseek_mcp.config.CONFIG_PATH", path):
+                self.assertEqual(_load_data(), accepted)
+            rejected = dict(accepted)
+            rejected["max_unexpected_budget"] = 1
+            path.write_text(json.dumps(rejected), encoding="utf-8")
+            path.chmod(0o600)
+            with (
+                patch("deepseek_mcp.config.CONFIG_PATH", path),
+                self.assertRaisesRegex(RuntimeError, "Unsupported"),
+            ):
+                _load_data()
 
 
 if __name__ == "__main__":
