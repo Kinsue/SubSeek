@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from deepseek_mcp import server
+from deepseek_mcp.agent_catalog import parse_agents
 from deepseek_mcp.agent_loop import AgentLoopCancelled, _call_with_retry
 from deepseek_mcp.provider_retry import MutationOutcomeError
 from deepseek_mcp.config import Config
@@ -625,12 +626,59 @@ server._record_usage(1, {
                             "type": "string",
                         },
                         "model": model,
+                        "agent": {
+                            "default": "",
+                            "title": "Agent",
+                            "type": "string",
+                        },
                     },
                     "required": ["task"],
                     "title": f"{name}Arguments",
                     "type": "object",
                 },
             )
+
+    def _catalog_config(self) -> Config:
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpdir, True)
+        config = Config("sk-test", Path(tmpdir), allowed_tools=["Read"])
+        config.agents = parse_agents(
+            [
+                {
+                    "id": "reviewer",
+                    "description": "reviewer",
+                    "capability": "readonly",
+                    "model": "deepseek-v4-pro",
+                }
+            ]
+        )
+        return config
+
+    def test_agent_argument_binds_catalog_entry_to_per_call_config(self) -> None:
+        config = self._catalog_config()
+        with patch.object(server.Config, "load", return_value=config):
+            loaded = server._load_config(server.READONLY_PROFILE, "flash", "reviewer")
+
+        self.assertEqual(loaded.delegation_capability, "readonly")
+        self.assertEqual(set(loaded.allowed_tools), {"Read", "Glob", "Grep"})
+        self.assertEqual(loaded.active_agent, "reviewer")
+        self.assertEqual(loaded.model, "deepseek-v4-pro")
+
+    def test_agent_argument_empty_selects_api_default(self) -> None:
+        config = self._catalog_config()
+        with patch.object(server.Config, "load", return_value=config):
+            loaded = server._load_config(server.READONLY_PROFILE, "flash", "")
+
+        self.assertEqual(loaded.active_agent, "readonly")
+        self.assertEqual(loaded.delegation_capability, "readonly")
+
+    def test_agent_argument_rejects_unknown_and_capability_contradiction(self) -> None:
+        config = self._catalog_config()
+        with patch.object(server.Config, "load", return_value=config):
+            with self.assertRaisesRegex(server.JobError, "available agents"):
+                server._load_config(server.CODING_PROFILE, "flash", "ghost")
+            with self.assertRaisesRegex(server.JobError, "capability"):
+                server._load_config(server.CODING_PROFILE, "flash", "reviewer")
 
 
 if __name__ == "__main__":

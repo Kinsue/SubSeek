@@ -22,6 +22,7 @@ from .agent_loop import (
     CancellationSignal,
     run_agent,
 )
+from .agent_catalog import MUTATION_TOOLS
 from .config import Config
 from .job_listing import (
     LEASE_EXCLUSIVE,
@@ -78,6 +79,7 @@ class JobRecord:
     task_length: int
     task_preview: str = ""
     capability: str = "coding"
+    agent: str = "coding"
     status: str = "queued"
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -100,6 +102,7 @@ class JobRecord:
         return {
             "job_id": self.job_id,
             "capability": self.capability,
+            "agent": self.agent,
             "status": self.status,
             "cancel_requested": self.cancel_event.is_set(),
             "accepting_messages": accepting_messages,
@@ -203,7 +206,8 @@ def _new_record(job_id: str, task: str, context: str, config: Config) -> JobReco
     return JobRecord(
         job_id=job_id, task=task, context=context, task_length=len(task),
         task_preview=task_preview(task), capability=config.delegation_capability,
-        status="running", started_at=time.time(),
+        agent=config.active_agent or config.delegation_capability, status="running",
+        started_at=time.time(),
     )
 
 
@@ -455,15 +459,14 @@ class DeepSeekJobManager:
             logger.exception("Failed to release workspace execution lease")
 
     def _ensure_capacity_locked(self, config: Config) -> None:
-        limit = config.max_parallel_agents
-        if len(self._running) >= limit:
-            raise JobBusy(full_pool_message(limit, self._running))
+        if len(self._running) >= config.max_parallel_agents:
+            raise JobBusy(full_pool_message(config.max_parallel_agents, self._running))
 
     def _ensure_lease_locked(self, config: Config) -> None:
         identity = config.expected_workspace_identity
         capability = config.delegation_capability
         if self._lease is None:
-            shared = capability != "coding"
+            shared = capability != "coding" and not MUTATION_TOOLS.intersection(config.allowed_tools)
             self._lease = self._acquire_ready_workspace_lease_locked(config, shared)
             self._lease_identity = identity
             self._lease_mode = LEASE_SHARED if shared else LEASE_EXCLUSIVE
@@ -474,9 +477,7 @@ class DeepSeekJobManager:
             require_no_pending(config)
         except TransactionRecoveryError as error:
             raise JobError(str(error)) from None
-        conflict = lease_conflict_message(
-            self._running, self._lease_mode or LEASE_EXCLUSIVE, capability
-        )
+        conflict = lease_conflict_message(self._running, self._lease_mode, capability)
         if conflict is not None:
             raise JobBusy(conflict)
 

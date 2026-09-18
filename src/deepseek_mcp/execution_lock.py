@@ -93,7 +93,7 @@ def acquire_workspace_lease(
         if _is_lock_conflict(error):
             raise WorkspaceLockBusy(
                 f"workspace is already owned by another DeepSeek execution: "
-                f"{workspace.resolve()}"
+                f"{workspace.resolve()}{_windows_shared_note()}"
             ) from error
         raise WorkspaceLockError(
             f"failed to acquire workspace execution lease: {error}"
@@ -214,6 +214,7 @@ def _open_lock_file(path: Path) -> int:
         ):
             raise WorkspaceLockBusy(
                 "workspace execution lock is already held"
+                + _windows_shared_note()
             ) from error
         raise WorkspaceLockError(
             f"failed to open workspace execution lock: {error}"
@@ -326,3 +327,12 @@ def _is_lock_conflict(error: OSError) -> bool:
             5, 32, 33,
         }
     return error.errno in {errno.EACCES, errno.EAGAIN}
+
+
+def _windows_shared_note() -> str:
+    if os.name != "nt":
+        return ""
+    return (
+        " (shared leases are POSIX-only; Windows takes an exclusive lease "
+        "for every delegation)"
+    )

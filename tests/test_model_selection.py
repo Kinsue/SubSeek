@@ -75,9 +75,9 @@ class ModelSelectionTests(unittest.TestCase):
             ):
                 loaded = server._load_config(CODING_PROFILE)
 
-        self.assertIs(loaded, config)
         self.assertEqual(loaded.model, "custom-flash")
         self.assertEqual(loaded.reasoning_effort, "low")
+        self.assertEqual(loaded.active_agent, "coding")
 
     def test_load_config_can_select_configured_pro_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -106,7 +106,7 @@ class ModelSelectionTests(unittest.TestCase):
             payload = server.start_deepseek("hard task", model="pro")
 
         self.assertIn('"ok": true', payload)
-        load_config.assert_called_once_with(CODING_PROFILE, "pro")
+        load_config.assert_called_once_with(CODING_PROFILE, "pro", "")
         manager.start.assert_called_once_with("hard task", "", config)
         self.assertNotIn("model", inspect.signature(server.send_deepseek_message).parameters)
 

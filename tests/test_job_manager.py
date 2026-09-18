@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from deepseek_mcp.agent_loop import AgentLoopCancelled
-from deepseek_mcp.config import Config
+from deepseek_mcp.config import DEFAULT_ALLOWED_TOOLS, Config
 from deepseek_mcp.job_listing import (
     LEASE_EXCLUSIVE,
     LEASE_SHARED,
@@ -56,6 +56,12 @@ class JobManagerTests(unittest.TestCase):
         return DeepSeekJobManager(lock_directory=self.lock_directory)
 
     def _config(self, workspace: Path | None = None, **overrides) -> Config:
+        capability = overrides.get("delegation_capability", "coding")
+        overrides.setdefault(
+            "allowed_tools",
+            ["Read", "Glob", "Grep"] if capability == "readonly"
+            else list(DEFAULT_ALLOWED_TOOLS),
+        )
         return Config(
             api_key="sk-test", workspace=workspace or self.workspace, **overrides
         )
@@ -870,6 +876,62 @@ class JobManagerTests(unittest.TestCase):
             release.set()
             self._assert_terminal(first, held["job_id"])
             self._assert_terminal(second, peered["job_id"])
+
+    def test_job_listing_reports_resolved_agent_id(self) -> None:
+        manager = self._manager()
+        config = self._config(active_agent="reviewer")
+
+        with patch("deepseek_mcp.job_manager.run_agent", return_value=_result()):
+            job = manager.start("review task", "", config)
+            self._assert_terminal(manager, job["job_id"])
+            rows = manager.list_jobs()
+
+        self.assertEqual(rows[0]["agent"], "reviewer")
+        self.assertIn("agent=reviewer", format_jobs_table(rows))
+
+    def test_blocked_listing_includes_agent_id(self) -> None:
+        manager = self._manager()
+        readonly = self._config(
+            delegation_capability="readonly", active_agent="reviewer"
+        )
+        coding = self._config()
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            started.set()
+            release.wait(2.0)
+            return _result(task)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            job = manager.start("read", "", readonly)
+            self.assertTrue(started.wait(1.0))
+            with self.assertRaises(JobBusy) as raised:
+                manager.start("write", "", coding)
+            release.set()
+            self._assert_terminal(manager, job["job_id"])
+
+        self.assertIn("agent=reviewer", str(raised.exception))
+
+    def test_readonly_with_mutation_tools_still_takes_exclusive_lease(self) -> None:
+        manager = self._manager()
+        config = self._config()
+        # Bypass Config validation to exercise manager-level defense in depth.
+        config.delegation_capability = "readonly"
+        config.allowed_tools = ["Read", "Write"]
+        release = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            release.wait(2.0)
+            return _result(task)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            job = manager.start("mutate", "", config)
+            self.assertEqual(manager._lease_mode, LEASE_EXCLUSIVE)
+            release.set()
+            self._assert_terminal(manager, job["job_id"])
+
+        self.assertIsNone(manager._lease_mode)
 
 
 if __name__ == "__main__":

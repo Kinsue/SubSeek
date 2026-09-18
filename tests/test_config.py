@@ -250,6 +250,55 @@ class ConfigTests(unittest.TestCase):
                         "credential",
                     )
 
+    def test_agents_catalog_is_validated_and_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loaded = Config._from_data(
+                {
+                    "workspace": str(tmpdir),
+                    "allowed_tools": ["Read"],
+                    "agents": [
+                        {
+                            "id": "reviewer",
+                            "description": "Read-only reviewer",
+                            "capability": "readonly",
+                        }
+                    ],
+                },
+                "credential",
+            )
+
+        self.assertIn("reviewer", {agent.id for agent in loaded.agents})
+        self.assertIn("coding", {agent.id for agent in loaded.agents})
+
+    def test_agents_catalog_rejects_mutation_tools_for_readonly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(RuntimeError, "Write"):
+                Config._from_data(
+                    {
+                        "workspace": str(tmpdir),
+                        "allowed_tools": ["Read"],
+                        "agents": [
+                            {
+                                "id": "reviewer",
+                                "description": "Read-only reviewer",
+                                "capability": "readonly",
+                                "allowed_tools": ["Read", "Write"],
+                            }
+                        ],
+                    },
+                    "credential",
+                )
+
+    def test_readonly_capability_rejects_mutation_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(RuntimeError, "mutation tools"):
+                Config(
+                    "credential",
+                    Path(tmpdir),
+                    delegation_capability="readonly",
+                    allowed_tools=["Read", "Write"],
+                )
+
     @unittest.skipUnless(
         os.name == "posix", "requires POSIX file modes"
     )

@@ -10,6 +10,15 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import windows_file_io
+from .agent_catalog import (
+    DEFAULT_ALLOWED_TOOLS,
+    KNOWN_TOOLS,
+    MUTATION_TOOLS,
+    AgentSpec,
+    BUILT_IN_AGENTS,
+    parse_agents,
+    validate_model as _validate_model,
+)
 from .budget_limits import (
     BUDGET_CONFIG_KEYS,
     BUDGET_KEY_ALIASES,
@@ -41,19 +50,6 @@ DEFAULT_MAX_TURNS = 50
 DEFAULT_MAX_PARALLEL_AGENTS = 16
 DEFAULT_MAX_RUN_SECONDS = 5 * 60 * 60
 HARD_MAX_RUN_SECONDS = 48 * 60 * 60
-DEFAULT_ALLOWED_TOOLS = [
-    "Read",
-    "Write",
-    "Edit",
-    "Bash",
-    "Glob",
-    "Grep",
-    "NotebookEdit",
-]
-KNOWN_TOOLS = frozenset(
-    {"Read", "Write", "Edit", "Bash", "Glob", "Grep", "NotebookEdit"}
-)
-MUTATION_TOOLS = frozenset({"Write", "Edit", "NotebookEdit"})
 CONFIG_KEYS = frozenset(
     {
         "api_key",
@@ -69,6 +65,7 @@ CONFIG_KEYS = frozenset(
         "max_parallel_agents",
         "allowed_tools",
         "base_url",
+        "agents",
     }
 ) | BUDGET_CONFIG_KEYS | frozenset(BUDGET_KEY_ALIASES)
 logger = logging.getLogger(__name__)
@@ -283,16 +280,6 @@ def _load_allowed_tools(data: dict) -> list[str]:
     return list(tools)
 
 
-def _validate_model(value: object, field_name: str = "model") -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise RuntimeError(f"{field_name} must be a non-empty string")
-    if value != value.strip() or any(ord(char) < 32 for char in value):
-        raise RuntimeError(
-            f"{field_name} must not contain surrounding or control whitespace"
-        )
-    return value
-
-
 def _load_model_slots(data: dict) -> tuple[str, str]:
     """Load user-configurable provider model IDs for the public Flash/Pro slots."""
     if "model" in data:
@@ -394,6 +381,10 @@ class Config:
     max_tool_calls_per_run: int = DEFAULT_MAX_TOOL_CALLS_PER_RUN
     max_mutation_bytes_per_run: int = DEFAULT_MAX_MUTATION_BYTES_PER_RUN
     max_parallel_agents: int = DEFAULT_MAX_PARALLEL_AGENTS
+    # Validated agent catalog (built-ins plus user-defined agents).
+    agents: tuple[AgentSpec, ...] = field(default_factory=lambda: BUILT_IN_AGENTS)
+    # Resolved agent id for the current per-call config (set by bind_agent).
+    active_agent: str = ""
 
     def __post_init__(self) -> None:
         if is_unsafe_workspace_root(self.workspace):
@@ -422,6 +413,13 @@ class Config:
         self._validate_budget_limits()
         if self.delegation_capability not in {"coding", "readonly"}:
             raise RuntimeError("invalid delegation capability")
+        if self.delegation_capability == "readonly":
+            mutations = sorted(MUTATION_TOOLS.intersection(self.allowed_tools))
+            if mutations:
+                raise RuntimeError(
+                    "readonly delegation cannot use mutation tools: "
+                    + ", ".join(mutations)
+                )
         self._validate_mutation_runtime()
 
     def _validate_budget_limits(self) -> None:
@@ -460,6 +458,7 @@ class Config:
             ),
             max_parallel_agents=_load_max_parallel_agents(data),
             allowed_tools=_load_allowed_tools(data),
+            agents=parse_agents(data.get("agents")),
             base_url=data.get("base_url", "https://api.deepseek.com"),
             flash_model=flash_model,
             pro_model=pro_model,

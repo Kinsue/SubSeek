@@ -15,7 +15,7 @@ TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 TASK_PREVIEW_CHARS = 80
 MAX_LIST_LINES = 64
 MAX_LIST_ROWS = MAX_LIST_LINES - 2
-TABLE_HEADER = "job_id | status | capability | task | started | age_s | tokens"
+TABLE_HEADER = "job_id | status | capability | agent | task | started | age_s | tokens"
 LEASE_SHARED = "shared"
 LEASE_EXCLUSIVE = "exclusive"
 
@@ -30,6 +30,13 @@ def task_preview(task: object) -> str:
 def _preview_of(job: object) -> str:
     preview = getattr(job, "task_preview", "") or getattr(job, "task", "")
     return task_preview(preview)
+
+
+def _agent_of(job: object) -> str:
+    agent = getattr(job, "agent", "")
+    if isinstance(agent, str) and agent:
+        return agent
+    return str(getattr(job, "capability", "coding"))
 
 
 def _sync_marker(job_id: object) -> str:
@@ -57,6 +64,7 @@ def row_from_job(job: object) -> dict[str, Any]:
         "sync": str(job_id).startswith("sync-"),
         "status": getattr(job, "status", "queued"),
         "capability": getattr(job, "capability", "coding"),
+        "agent": _agent_of(job),
         "task_preview": _preview_of(job),
         "created_at": getattr(job, "created_at", 0.0) or 0.0,
         "started_at": getattr(job, "started_at", None),
@@ -77,7 +85,8 @@ def list_rows(records: Iterable[object], status: str = "") -> list[dict[str, Any
 def _pool_line(job_id: str, job: object) -> str:
     return (
         f"{job_id}{_sync_marker(job_id)} {getattr(job, 'status', 'running')} "
-        f"{getattr(job, 'capability', 'coding')} {_preview_of(job)}"
+        f"{getattr(job, 'capability', 'coding')} agent={_agent_of(job)} "
+        f"{_preview_of(job)}"
     )
 
 
@@ -144,7 +153,8 @@ def _format_row(row: dict[str, Any], now: float) -> str:
     marker = " (sync)" if row.get("sync") else ""
     return (
         f"{row['job_id']}{marker} | {row['status']} | {row['capability']} | "
-        f"{row['task_preview']} | {_started_iso(row['started_at'])} | "
+        f"agent={row['agent']} | {row['task_preview']} | "
+        f"{_started_iso(row['started_at'])} | "
         f"{_age_seconds(now, row['started_at'])} | {token_text}"
     )
 
