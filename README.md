@@ -373,11 +373,15 @@ age, and total tokens for finished jobs. Entries marked `(sync)` are
 in-flight synchronous delegations: they appear in listings but do not accept
 per-job messages.
 
-Coding jobs hold an exclusive cross-process lease on the workspace: a second
-process targeting the same workspace is rejected while any job runs,
-admission fails closed while pending mutation transactions await recovery,
-and if the configured workspace changes while jobs are running, new
-admissions fail closed until the pool drains.
+Workspace access is lease-governed: readonly jobs take a shared
+cross-process lease — multiple read-only agents, in this or another process,
+can analyze one workspace concurrently — while any coding job requires the
+exclusive lease and is admitted only when no other job is running;
+conversely, readonly jobs are rejected while a coding job runs. Admission
+also fails closed while pending mutation transactions await recovery, and if
+the configured workspace changes while jobs are running, new admissions
+fail closed until the pool drains. Shared leases are POSIX-only; on Windows
+every delegation takes the exclusive lease.
 
 **Workspace root** auto-follows the directory where you launch the host client.
 To lock it to a fixed path regardless of cwd, add `"workspace": "/abs/path"`

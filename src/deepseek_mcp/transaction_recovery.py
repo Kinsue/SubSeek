@@ -73,7 +73,7 @@ def acknowledge_with_lease(
 def _pending(config: Config) -> list[dict[str, object]]:
     try:
         return pending_records(config)
-    except TransactionJournalError:
+    except (TransactionJournalError, OSError):
         raise TransactionRecoveryError(
             "transaction recovery journal is unavailable; DO NOT RETRY"
         ) from None

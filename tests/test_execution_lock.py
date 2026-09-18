@@ -80,6 +80,32 @@ class WorkspaceExecutionLeaseTests(unittest.TestCase):
 
         self.assertEqual(process.exitcode, 0)
 
+    @unittest.skipUnless(os.name == "posix", "shared flock is POSIX-only")
+    def test_shared_leases_coexist_and_exclude_exclusive(self) -> None:
+        first = acquire_workspace_lease(
+            self.workspace, self.lock_directory, shared=True
+        )
+        try:
+            second = acquire_workspace_lease(
+                self.workspace, self.lock_directory, shared=True
+            )
+            try:
+                with self.assertRaises(WorkspaceLockBusy):
+                    acquire_workspace_lease(self.workspace, self.lock_directory)
+            finally:
+                second.release()
+        finally:
+            first.release()
+
+        exclusive = acquire_workspace_lease(self.workspace, self.lock_directory)
+        try:
+            with self.assertRaises(WorkspaceLockBusy):
+                acquire_workspace_lease(
+                    self.workspace, self.lock_directory, shared=True
+                )
+        finally:
+            exclusive.release()
+
     def test_process_death_releases_workspace_lease(self) -> None:
         process, _ = self._start_holder()
         process.terminate()

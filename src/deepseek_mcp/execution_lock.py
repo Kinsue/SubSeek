@@ -69,8 +69,16 @@ def acquire_workspace_lease(
     lock_directory: Path | None = None,
     *,
     expected_identity: bytes | None = None,
+    shared: bool = False,
 ) -> WorkspaceExecutionLease:
-    """Acquire a non-blocking native lease for one canonical workspace."""
+    """Acquire a non-blocking native lease for one canonical workspace.
+
+    POSIX uses an advisory ``flock``: ``shared=True`` requests ``LOCK_SH`` so
+    readonly delegations may coexist, while the default ``LOCK_EX`` excludes
+    everything. Windows has no portable shared flock, so ``shared`` is honoured
+    as exclusive there and readonly parallelism is POSIX-only; the error type
+    and messages are unchanged in both modes.
+    """
     directory = lock_directory or DEFAULT_LOCK_DIRECTORY
     identity = workspace_identity(workspace)
     if expected_identity is not None and identity != expected_identity:
@@ -79,7 +87,7 @@ def acquire_workspace_lease(
     fd = _open_lock_file(path)
 
     try:
-        _lock_fd(fd)
+        _lock_fd(fd, shared)
     except OSError as error:
         os.close(fd)
         if _is_lock_conflict(error):
@@ -299,10 +307,11 @@ def _same_identity(first: os.stat_result, second: os.stat_result) -> bool:
     return all(getattr(first, field) == getattr(second, field) for field in fields)
 
 
-def _lock_fd(fd: int) -> None:
+def _lock_fd(fd: int, shared: bool = False) -> None:
     if os.name == "nt":
         return
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+    fcntl.flock(fd, mode | fcntl.LOCK_NB)
 
 
 def _unlock_fd(fd: int) -> None:

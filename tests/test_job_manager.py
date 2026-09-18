@@ -9,6 +9,8 @@ from unittest.mock import patch
 from deepseek_mcp.agent_loop import AgentLoopCancelled
 from deepseek_mcp.config import Config
 from deepseek_mcp.job_listing import (
+    LEASE_EXCLUSIVE,
+    LEASE_SHARED,
     MAX_LIST_LINES,
     MAX_LIST_ROWS,
     TABLE_HEADER,
@@ -450,7 +452,9 @@ class JobManagerTests(unittest.TestCase):
 
     def test_pool_runs_concurrent_jobs_up_to_limit(self) -> None:
         manager = self._manager()
-        config = self._config(max_parallel_agents=2)
+        config = self._config(
+            max_parallel_agents=2, delegation_capability="readonly"
+        )
         barrier = threading.Barrier(2, timeout=2.0)
 
         def fake_run_agent(task, config, **kwargs):
@@ -468,7 +472,9 @@ class JobManagerTests(unittest.TestCase):
 
     def test_pool_full_rejection_lists_running_jobs(self) -> None:
         manager = self._manager()
-        config = self._config(max_parallel_agents=2)
+        config = self._config(
+            max_parallel_agents=2, delegation_capability="readonly"
+        )
         release = threading.Event()
 
         def fake_run_agent(task, config, **kwargs):
@@ -491,15 +497,17 @@ class JobManagerTests(unittest.TestCase):
 
     def test_workspace_lease_is_acquired_once_and_released_at_drain(self) -> None:
         manager = self._manager()
-        config = self._config(max_parallel_agents=2)
+        config = self._config(
+            max_parallel_agents=2, delegation_capability="readonly"
+        )
         release = threading.Event()
         acquired: list[object] = []
         released: list[object] = []
         original_acquire = manager._acquire_workspace_lease_locked
         original_release = manager._release_workspace_lease_locked
 
-        def counting_acquire(cfg):
-            lease = original_acquire(cfg)
+        def counting_acquire(cfg, shared=False):
+            lease = original_acquire(cfg, shared)
             acquired.append(lease)
             return lease
 
@@ -537,7 +545,9 @@ class JobManagerTests(unittest.TestCase):
 
     def test_sync_delegation_occupies_a_pool_slot(self) -> None:
         manager = self._manager()
-        config = self._config(max_parallel_agents=2)
+        config = self._config(
+            max_parallel_agents=2, delegation_capability="readonly"
+        )
         started = threading.Event()
         release = threading.Event()
         errors: list[BaseException] = []
@@ -621,8 +631,8 @@ class JobManagerTests(unittest.TestCase):
 
         other = self.workspace.parent / "other"
         other.mkdir()
-        config_a = self._config()
-        config_b = self._config(other)
+        config_a = self._config(delegation_capability="readonly")
+        config_b = self._config(other, delegation_capability="readonly")
         with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
             first = manager.start("first", "", config_a)
             with self.assertRaisesRegex(JobError, "workspace") as raised:
@@ -639,7 +649,9 @@ class JobManagerTests(unittest.TestCase):
 
     def test_admission_rechecks_pending_transactions_with_cached_lease(self) -> None:
         manager = self._manager()
-        config = self._config(max_parallel_agents=2)
+        config = self._config(
+            max_parallel_agents=2, delegation_capability="readonly"
+        )
         release = threading.Event()
 
         def fake_run_agent(task, config, **kwargs):
@@ -648,6 +660,7 @@ class JobManagerTests(unittest.TestCase):
 
         with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
             first = manager.start("first", "", config)
+            self.assertEqual(manager._lease_mode, LEASE_SHARED)
             with patch(
                 "deepseek_mcp.job_manager.require_no_pending",
                 side_effect=TransactionRecoveryError("unacknowledged transactions"),
@@ -674,6 +687,7 @@ class JobManagerTests(unittest.TestCase):
         self.assertEqual(manager._running, {})
         self.assertIsNone(manager._lease)
         self.assertIsNone(manager._lease_identity)
+        self.assertIsNone(manager._lease_mode)
 
         with patch("deepseek_mcp.job_manager.run_agent", return_value=_result()):
             job = manager.start("after", "", config)
@@ -700,6 +714,7 @@ class JobManagerTests(unittest.TestCase):
         self.assertEqual(manager._running, {})
         self.assertIsNone(manager._lease)
         self.assertIsNone(manager._lease_identity)
+        self.assertIsNone(manager._lease_mode)
 
     def test_full_pool_message_is_bounded(self) -> None:
         class _Rec:
@@ -750,6 +765,111 @@ class JobManagerTests(unittest.TestCase):
         self.assertIn("(sync)", str(raised.exception))
         self.assertIn("(sync)", format_jobs_table(rows))
         self.assertEqual(errors, [])
+
+    def test_coding_admission_while_readonly_running_is_rejected(self) -> None:
+        manager = self._manager()
+        readonly = self._config(delegation_capability="readonly")
+        coding = self._config()
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            started.set()
+            release.wait(2.0)
+            return _result(task)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            readonly_job = manager.start("read", "", readonly)
+            self.assertTrue(started.wait(1.0))
+            with self.assertRaises(JobBusy) as raised:
+                manager.start("write", "", coding)
+            release.set()
+            self._assert_terminal(manager, readonly_job["job_id"])
+
+        message = str(raised.exception)
+        self.assertIn("exclusive workspace lease", message)
+        self.assertIn("jobs still running", message)
+        self.assertIn(readonly_job["job_id"], message)
+        self.assertIn("readonly", message)
+
+    def test_readonly_admission_while_coding_running_is_rejected(self) -> None:
+        manager = self._manager()
+        coding = self._config()
+        readonly = self._config(delegation_capability="readonly")
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            started.set()
+            release.wait(2.0)
+            return _result(task)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            coding_job = manager.start("write", "", coding)
+            self.assertTrue(started.wait(1.0))
+            with self.assertRaises(JobBusy) as raised:
+                manager.start("read", "", readonly)
+            release.set()
+            self._assert_terminal(manager, coding_job["job_id"])
+
+        message = str(raised.exception)
+        self.assertIn("cannot share the exclusive workspace lease", message)
+        self.assertIn("jobs still running", message)
+        self.assertIn(coding_job["job_id"], message)
+
+    def test_lease_mode_transitions_only_via_full_drain(self) -> None:
+        manager = self._manager()
+        readonly = self._config(delegation_capability="readonly")
+        coding = self._config()
+        release = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            release.wait(2.0)
+            return _result(task)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            first = manager.start("read", "", readonly)
+            self.assertEqual(manager._lease_mode, LEASE_SHARED)
+            release.set()
+            self._assert_terminal(manager, first["job_id"])
+            self.assertIsNone(manager._lease_mode)
+
+            release.clear()
+            second = manager.start("write", "", coding)
+            self.assertEqual(manager._lease_mode, LEASE_EXCLUSIVE)
+            release.set()
+            self._assert_terminal(manager, second["job_id"])
+            self.assertIsNone(manager._lease_mode)
+
+            release.clear()
+            third = manager.start("read again", "", readonly)
+            self.assertEqual(manager._lease_mode, LEASE_SHARED)
+            release.set()
+            self._assert_terminal(manager, third["job_id"])
+            self.assertIsNone(manager._lease_mode)
+
+    def test_readonly_leases_coexist_across_managers_but_exclude_coding(self) -> None:
+        first = self._manager()
+        second = self._manager()
+        readonly = self._config(delegation_capability="readonly")
+        coding = self._config()
+        release = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            release.wait(2.0)
+            return _result(task)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            held = first.start("read a", "", readonly)
+            peered = second.start("read b", "", readonly)
+            with self.assertRaises(JobBusy):
+                second.start("write b", "", coding)
+            third = self._manager()
+            with self.assertRaises(JobBusy):
+                third.start("write c", "", coding)
+            release.set()
+            self._assert_terminal(first, held["job_id"])
+            self._assert_terminal(second, peered["job_id"])
 
 
 if __name__ == "__main__":

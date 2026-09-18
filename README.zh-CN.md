@@ -352,10 +352,12 @@ token 记账基于 provider 用量：运行预算按最近一次请求上报的 
 总 token 用量。标记 `(sync)` 的条目是进行中的同步委派：它们出现在清单
 里，但不接受按任务发送的消息。
 
-coding 任务对 workspace 持有跨进程独占租约：任一任务运行期间，第二个
-进程对同一 workspace 的请求会被拒绝；存在待恢复的 mutation 事务时准入
-直接失败；若任务运行期间配置的 workspace 发生变化，新准入会失败关闭
-直到池排空。
+workspace 访问由租约约束：readonly 任务持共享跨进程租约——多个只读
+Agent（无论本进程还是其他进程）可并发分析同一 workspace；任何 coding
+任务需要独占租约，仅在无其他任务运行时准入；反之 coding 运行期间
+readonly 会被拒绝。存在待恢复的 mutation 事务时准入直接失败；任务
+运行期间配置的 workspace 发生变化时，新准入失败关闭直到池排空。
+共享租约仅支持 POSIX；Windows 上所有委派都持独占租约。
 
 **工作区根目录**默认跟随启动宿主客户端时的当前目录。它是文件工具的路径边界，
 也是 coding Bash 的工作目录；对 `trusted_host` Bash 而言它不是操作系统级沙箱。

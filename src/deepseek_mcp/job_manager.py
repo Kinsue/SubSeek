@@ -24,12 +24,17 @@ from .agent_loop import (
 )
 from .config import Config
 from .job_listing import (
-    JobOutcome,
-    apply_cancelled_outcome,
+    LEASE_EXCLUSIVE,
+    LEASE_SHARED,
     full_pool_message,
+    lease_conflict_message,
     list_rows,
     prune_records,
     task_preview,
+)
+from .job_outcomes import (
+    JobOutcome,
+    apply_cancelled_outcome,
     workspace_mismatch_message,
 )
 from .provider_retry import MutationOutcomeError
@@ -194,6 +199,14 @@ def validate_delegation_input(task: str, context: str = "") -> None:
     _bounded_text_bytes("context", context, MAX_CONTEXT_BYTES)
 
 
+def _new_record(job_id: str, task: str, context: str, config: Config) -> JobRecord:
+    return JobRecord(
+        job_id=job_id, task=task, context=context, task_length=len(task),
+        task_preview=task_preview(task), capability=config.delegation_capability,
+        status="running", started_at=time.time(),
+    )
+
+
 class DeepSeekJobManager:
     """Thread-safe manager for a bounded pool of DeepSeek execution slots."""
 
@@ -203,12 +216,11 @@ class DeepSeekJobManager:
         self._running: dict[str, JobRecord] = {}
         self._lease: WorkspaceExecutionLease | None = None
         self._lease_identity: str | None = None
+        self._lease_mode: str | None = None
         self._lock_directory = lock_directory
 
     def run_sync(
-        self,
-        task: str,
-        config: Config,
+        self, task: str, config: Config,
         cancel_signal: CancellationSignal | None = None,
     ) -> dict[str, Any]:
         """Run synchronous delegation while occupying one pool slot."""
@@ -219,16 +231,7 @@ class DeepSeekJobManager:
             self._ensure_capacity_locked(config)
             self._ensure_lease_locked(config)
             slot_id = f"sync-{uuid.uuid4().hex[:12]}"
-            self._running[slot_id] = JobRecord(
-                job_id=slot_id,
-                task=task,
-                context="",
-                task_length=len(task),
-                task_preview=task_preview(task),
-                capability=config.delegation_capability,
-                status="running",
-                started_at=time.time(),
-            )
+            self._running[slot_id] = _new_record(slot_id, task, "", config)
             lease = self._lease
             if lease is None:
                 self._running.pop(slot_id, None)
@@ -253,16 +256,7 @@ class DeepSeekJobManager:
             self._ensure_lease_locked(config)
 
             job_id = uuid.uuid4().hex[:12]
-            job = JobRecord(
-                job_id=job_id,
-                task=task,
-                context=context,
-                task_length=len(task),
-                task_preview=task_preview(task),
-                capability=config.delegation_capability,
-                status="running",
-                started_at=time.time(),
-            )
+            job = _new_record(job_id, task, context, config)
             self._jobs[job_id] = job
             self._running[job_id] = job
 
@@ -400,13 +394,8 @@ class DeepSeekJobManager:
         )
 
     def _finish_job(
-        self,
-        job_id: str,
-        *,
-        desired_status: str,
-        result: dict[str, Any] | None,
-        error: str | None,
-        preserve_mutation_error: bool = False,
+        self, job_id: str, *, desired_status: str, result: dict[str, Any] | None,
+        error: str | None, preserve_mutation_error: bool = False,
     ) -> None:
         """Commit one terminal state atomically with accepted cancellation."""
         with self._lock:
@@ -432,6 +421,7 @@ class DeepSeekJobManager:
     def _acquire_workspace_lease_locked(
         self,
         config: Config,
+        shared: bool = False,
     ) -> WorkspaceExecutionLease:
         try:
             assert config.expected_workspace_identity is not None
@@ -439,6 +429,7 @@ class DeepSeekJobManager:
                 config.workspace,
                 self._lock_directory,
                 expected_identity=bytes.fromhex(config.expected_workspace_identity),
+                shared=shared,
             )
         except WorkspaceLockBusy as error:
             raise JobBusy(str(error)) from error
@@ -446,9 +437,9 @@ class DeepSeekJobManager:
             raise JobError(str(error)) from error
 
     def _acquire_ready_workspace_lease_locked(
-        self, config: Config,
+        self, config: Config, shared: bool = False,
     ) -> WorkspaceExecutionLease:
-        lease = self._acquire_workspace_lease_locked(config)
+        lease = self._acquire_workspace_lease_locked(config, shared)
         try:
             require_no_pending(config)
         except TransactionRecoveryError as error:
@@ -470,22 +461,31 @@ class DeepSeekJobManager:
 
     def _ensure_lease_locked(self, config: Config) -> None:
         identity = config.expected_workspace_identity
+        capability = config.delegation_capability
         if self._lease is None:
-            self._lease = self._acquire_ready_workspace_lease_locked(config)
+            shared = capability != "coding"
+            self._lease = self._acquire_ready_workspace_lease_locked(config, shared)
             self._lease_identity = identity
-        elif identity != self._lease_identity:
+            self._lease_mode = LEASE_SHARED if shared else LEASE_EXCLUSIVE
+            return
+        if identity != self._lease_identity:
             raise JobError(workspace_mismatch_message(self._lease_identity, identity))
-        else:
-            try:
-                require_no_pending(config)
-            except TransactionRecoveryError as error:
-                raise JobError(str(error)) from None
+        try:
+            require_no_pending(config)
+        except TransactionRecoveryError as error:
+            raise JobError(str(error)) from None
+        conflict = lease_conflict_message(
+            self._running, self._lease_mode or LEASE_EXCLUSIVE, capability
+        )
+        if conflict is not None:
+            raise JobBusy(conflict)
 
     def _release_lease_if_idle_locked(self) -> None:
         if self._running or self._lease is None:
             return
         lease, self._lease = self._lease, None
         self._lease_identity = None
+        self._lease_mode = None
         self._release_workspace_lease_locked(lease)
 
     def _get_locked(self, job_id: str) -> JobRecord:

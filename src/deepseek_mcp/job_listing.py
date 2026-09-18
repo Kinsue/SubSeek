@@ -1,61 +1,23 @@
-"""Bounded text rendering and terminal-outcome helpers for DeepSeek jobs.
+"""Bounded text rendering for the DeepSeek agent work list and pool errors.
 
-Pure helpers so ``job_manager`` and ``server`` stay small and free of circular
-imports: this module intentionally never imports ``job_manager``. Records are
-read structurally (``getattr``) so any object with the ``JobRecord`` shape
-works. Outcome helpers only depend on ``mutation_outcome``.
+Pure data-in/text-out helpers so ``job_manager`` and ``server`` stay small and
+free of circular imports: this module intentionally never imports
+``job_manager``. Records are read structurally (``getattr``) so any object with
+the ``JobRecord`` shape works.
 """
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
-
-from .mutation_outcome import mutation_failure_message, records_from_result
 
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 TASK_PREVIEW_CHARS = 80
 MAX_LIST_LINES = 64
 MAX_LIST_ROWS = MAX_LIST_LINES - 2
 TABLE_HEADER = "job_id | status | capability | task | started | age_s | tokens"
-CANCELLED_ERROR = "DeepSeek job cancelled by parent agent"
-
-
-@dataclass(frozen=True)
-class JobOutcome:
-    """Terminal outcome produced by one background agent run."""
-
-    status: str
-    result: dict[str, Any] | None
-    error: str | None
-    preserve_mutation_error: bool = False
-
-
-def apply_cancelled_outcome(job: Any, outcome: JobOutcome) -> None:
-    """Force a cancellation terminal state while preserving mutation evidence."""
-    records = records_from_result(outcome.result)
-    job.cancel_event.set()
-    job.status = "cancelled"
-    job.result = None
-    if records:
-        job.error = mutation_failure_message(records, CANCELLED_ERROR)
-    elif outcome.preserve_mutation_error:
-        job.error = outcome.error
-    else:
-        job.error = outcome.error if outcome.status == "cancelled" else CANCELLED_ERROR
-
-
-def workspace_mismatch_message(
-    lease_identity: str | None, requested_identity: str | None
-) -> str:
-    """Fail-closed message for a cached lease that no longer matches the request."""
-    return (
-        "workspace changed while DeepSeek jobs are running: lease workspace "
-        f"identity {lease_identity} does not match requested workspace identity "
-        f"{requested_identity}; wait for running jobs to drain before delegating "
-        "to another workspace"
-    )
+LEASE_SHARED = "shared"
+LEASE_EXCLUSIVE = "exclusive"
 
 
 def task_preview(task: object) -> str:
@@ -119,18 +81,47 @@ def _pool_line(job_id: str, job: object) -> str:
     )
 
 
+def _listing_lines(running: Mapping[str, Any]) -> tuple[list[str], int]:
+    entries = list(running.items())
+    lines = [_pool_line(job_id, job) for job_id, job in entries[:MAX_LIST_ROWS]]
+    return lines, len(entries) - len(lines)
+
+
 def full_pool_message(limit: int, running: Mapping[str, Any]) -> str:
     """Build the bounded pool-full rejection; one line per running job."""
     header = f"DeepSeek pool is full (max_parallel_agents={limit})"
-    entries = list(running.items())
-    lines = [_pool_line(job_id, job) for job_id, job in entries[:MAX_LIST_ROWS]]
+    lines, remaining = _listing_lines(running)
     if not lines:
         return header
     message = f"{header}; running:\n" + "\n".join(lines)
-    remaining = len(entries) - len(lines)
     if remaining > 0:
         message += f"\n[truncated: {remaining} more running jobs]"
     return message
+
+
+def _blocked_message(blocker: str, running: Mapping[str, Any]) -> str:
+    lines, remaining = _listing_lines(running)
+    message = f"{blocker}; {len(running)} jobs still running:"
+    if lines:
+        message += "\n" + "\n".join(lines)
+    if remaining > 0:
+        message += f"\n[truncated: {remaining} more running jobs]"
+    return message
+
+
+def lease_conflict_message(
+    running: Mapping[str, Any], lease_mode: str, capability: str
+) -> str | None:
+    """Return a bounded rejection when the requested lease mode conflicts."""
+    if capability == "coding":
+        return _blocked_message(
+            "coding delegation requires the exclusive workspace lease", running
+        )
+    if lease_mode == LEASE_EXCLUSIVE:
+        return _blocked_message(
+            "readonly delegation cannot share the exclusive workspace lease", running
+        )
+    return None
 
 
 def _started_iso(started_at: object) -> str:
