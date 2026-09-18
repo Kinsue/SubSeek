@@ -231,11 +231,8 @@ def register_agent_tool(
     return mcp_tool(annotations=annotations)(fn)
 
 
-def refresh_tool_docstrings(config: object, functions: Iterable) -> None:
-    """Overwrite delegation docstrings with the config catalog; never raises.
-
-    A missing or broken config leaves the built-in-only docstrings in place.
-    """
+def _doc_catalog(config: object) -> Mapping[str, AgentSpec]:
+    """Resolve the catalog for tool metadata; never raises (built-ins on failure)."""
     if config is None:
         try:
             from .config import Config
@@ -244,14 +241,55 @@ def refresh_tool_docstrings(config: object, functions: Iterable) -> None:
         except Exception:
             config = None
     try:
-        catalog = catalog_from_config(config)
+        return catalog_from_config(config)
     except Exception:
         try:
-            catalog = {agent.id: agent for agent in parse_agents(getattr(config, "agents", None))}
+            return {
+                agent.id: agent
+                for agent in parse_agents(getattr(config, "agents", None))
+            }
         except Exception:
-            catalog = DEFAULT_CATALOG
+            return DEFAULT_CATALOG
+
+
+def refresh_tool_docstrings(config: object, functions: Iterable) -> None:
+    """Overwrite delegation docstrings with the config catalog; never raises.
+
+    A missing or broken config leaves the built-in-only docstrings in place.
+    """
+    catalog = _doc_catalog(config)
     for function in functions:
         description = getattr(function, "catalog_description", None)
         if not isinstance(description, str) or not description:
             description = "DeepSeek delegation sub-agent."
         function.__doc__ = tool_docstring(description, catalog)
+
+
+def refresh_registered_tool_descriptions(
+    mcp_server: Any, functions: Iterable, config: object = None
+) -> None:
+    """Update the registered MCP ``Tool`` descriptions (what ``tools/list`` serves).
+
+    mcp 1.29.x (pinned in requirements.lock) snapshots ``fn.__doc__`` into the
+    ``Tool`` object at registration, so mutating ``fn.__doc__`` afterwards never
+    reaches hosts; this function updates ``tool.description`` instead. The
+    private ``_tool_manager._tools`` layout is version-coupled: any missing
+    attribute silently degrades to the built-in descriptions rather than
+    crashing startup.
+    """
+    catalog = _doc_catalog(config)
+    try:
+        tools = mcp_server._tool_manager._tools
+    except Exception:
+        return
+    for function in functions:
+        try:
+            tool = tools.get(getattr(function, "__name__", ""))
+        except Exception:
+            continue
+        if tool is None:
+            continue
+        description = getattr(function, "catalog_description", None)
+        if not isinstance(description, str) or not description:
+            description = "DeepSeek delegation sub-agent."
+        tool.description = tool_docstring(description, catalog)

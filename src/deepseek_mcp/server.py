@@ -28,7 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from . import __version__
-from .agent_catalog import bind_agent, refresh_tool_docstrings, register_agent_tool
+from .agent_catalog import bind_agent, refresh_registered_tool_descriptions, register_agent_tool
 from .agent_loop import AgentLoopCancelled, AgentLoopError
 from .token_budget import bounded_budget_message, is_budget_error, log_effective_budgets
 from .provider_retry import MutationOutcomeError, MutationOutcomeCancelled
@@ -488,7 +488,7 @@ def main() -> None:
         raise SystemExit(1) from None
     _ensure_runtime_logging()
     logger.info("deepseek-mcp v%s starting (mode=%s)", __version__, mode)
-    log_effective_budgets(logger); refresh_tool_docstrings(None, (delegate_to_deepseek, delegate_to_deepseek_readonly, start_deepseek, start_deepseek_readonly))
+    log_effective_budgets(logger); refresh_registered_tool_descriptions(mcp, (delegate_to_deepseek, delegate_to_deepseek_readonly, start_deepseek, start_deepseek_readonly))
     try:
         mcp.run()
     except Exception as e:

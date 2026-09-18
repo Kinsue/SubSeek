@@ -1,76 +1,99 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
-from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import patch
+
+from mcp.server.fastmcp import FastMCP
 
 from deepseek_mcp.agent_catalog import (
     MODEL_PRECEDENCE_LINE,
     parse_agents,
-    refresh_tool_docstrings,
+    refresh_registered_tool_descriptions,
     register_agent_tool,
 )
+from deepseek_mcp.config import Config
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def _mcp_tool(annotations=None):
-    def decorate(fn):
-        return fn
-
-    return decorate
+def _served_description(tools, name: str) -> str:
+    for tool in tools:
+        if tool.name == name:
+            return tool.description or ""
+    raise AssertionError(f"tool {name} was not registered")
 
 
 class AgentDocstringTests(unittest.TestCase):
-    def _config(self) -> SimpleNamespace:
-        return SimpleNamespace(
-            agents=parse_agents(
-                [
-                    {
-                        "id": "reviewer",
-                        "description": "Reads only",
-                        "capability": "readonly",
-                    }
-                ]
-            )
+    def _config(self) -> Config:
+        config = Config("sk-test", ROOT, allowed_tools=["Read"])
+        config.agents = parse_agents(
+            [
+                {
+                    "id": "reviewer",
+                    "description": "Reads only",
+                    "capability": "readonly",
+                }
+            ]
         )
+        return config
 
-    def test_refresh_renders_user_agents_and_precedence(self) -> None:
-        def tool() -> str:
-            """old docstring"""
+    def _server(self):
+        server = FastMCP("agent-docstring-test")
+
+        def delegate() -> str:
             return "x"
 
-        refresh_tool_docstrings(self._config(), (tool,))
+        register_agent_tool(server.tool, None, "Run a delegation.", delegate)
+        return server, delegate
 
-        self.assertIn("reviewer: Reads only", tool.__doc__)
-        self.assertIn("Model precedence:", tool.__doc__)
-        self.assertIn(MODEL_PRECEDENCE_LINE, tool.__doc__)
+    def test_refresh_updates_the_served_tool_description(self) -> None:
+        server, delegate = self._server()
+        name = delegate.__name__
+        before = _served_description(asyncio.run(server.list_tools()), name)
+        self.assertNotIn("reviewer", before)
 
-    def test_refresh_without_config_falls_back_to_builtins(self) -> None:
-        def tool() -> str:
-            """old docstring"""
-            return "x"
+        refresh_registered_tool_descriptions(server, (delegate,), self._config())
+
+        after = _served_description(asyncio.run(server.list_tools()), name)
+        self.assertIn("reviewer", after)
+        self.assertIn("Reads only", after)
+        self.assertIn(MODEL_PRECEDENCE_LINE, after)
+
+    def test_refresh_failure_keeps_the_builtin_description(self) -> None:
+        server, delegate = self._server()
+        name = delegate.__name__
 
         with patch(
             "deepseek_mcp.config.Config.load",
             side_effect=RuntimeError("no config"),
         ):
-            refresh_tool_docstrings(None, (tool,))
+            refresh_registered_tool_descriptions(server, (delegate,), None)
 
-        self.assertIn("coding:", tool.__doc__)
-        self.assertIn("Model precedence:", tool.__doc__)
-        self.assertNotIn("reviewer", tool.__doc__)
+        description = _served_description(asyncio.run(server.list_tools()), name)
+        self.assertIn("coding:", description)
+        self.assertIn(MODEL_PRECEDENCE_LINE, description)
+        self.assertNotIn("reviewer", description)
 
-    def test_register_agent_tool_embeds_precedence(self) -> None:
-        def tool() -> str:
+    def test_missing_tool_manager_is_a_silent_noop(self) -> None:
+        class _FakeServer:
+            pass
+
+        def delegate() -> str:
             return "x"
 
-        registered = register_agent_tool(
-            _mcp_tool, None, "Run a coding delegation.", tool
+        delegate.catalog_description = "Run a delegation."
+
+        refresh_registered_tool_descriptions(
+            _FakeServer(), (delegate,), self._config()
         )
 
-        self.assertIs(registered, tool)
-        self.assertIn("Run a coding delegation.", tool.__doc__)
-        self.assertIn("Model precedence:", tool.__doc__)
-        self.assertEqual(tool.catalog_description, "Run a coding delegation.")
+    def test_register_agent_tool_embeds_precedence(self) -> None:
+        server, delegate = self._server()
+
+        self.assertEqual(delegate.catalog_description, "Run a delegation.")
+        self.assertIn(MODEL_PRECEDENCE_LINE, delegate.__doc__)
 
 
 if __name__ == "__main__":
