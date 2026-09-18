@@ -29,6 +29,7 @@ from mcp.types import ToolAnnotations
 
 from . import __version__
 from .agent_loop import AgentLoopCancelled, AgentLoopError
+from .token_budget import bounded_budget_message, is_budget_error, log_effective_budgets
 from .provider_retry import MutationOutcomeError, MutationOutcomeCancelled
 from .mutation_outcome import mutation_failure_message, records_from_result
 from .config import Config
@@ -315,7 +316,10 @@ async def _delegate(task: str, context: str, profile: ExecutionProfile, model: M
     except MutationOutcomeError as e:
         logger.error("DeepSeek delegation stopped category=mutation_outcome")
         return f"ERROR: {e}"
-    except AgentLoopError:
+    except AgentLoopError as e:
+        if is_budget_error(e):
+            logger.error("DeepSeek delegation stopped category=budget")
+            return bounded_budget_message(e)
         logger.error("DeepSeek delegation failed category=agent")
         return "ERROR: DeepSeek agent loop failed"
     except Exception:
@@ -480,11 +484,8 @@ def main() -> None:
     except (RuntimeError, JobError):
         raise SystemExit(1) from None
     _ensure_runtime_logging()
-    logger.info(
-        "deepseek-mcp v%s starting (mode=%s)",
-        __version__,
-        mode,
-    )
+    logger.info("deepseek-mcp v%s starting (mode=%s)", __version__, mode)
+    log_effective_budgets(logger)
     try:
         mcp.run()
     except Exception as e:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import tempfile
@@ -16,9 +17,8 @@ from openai import APIConnectionError, APIError
 from deepseek_mcp.agent_loop import (
     AgentLoopCancelled,
     AgentLoopError,
-    MAX_OUTPUT_TOKENS_PER_REQUEST,
+    BudgetExceededError,
     MAX_PROVIDER_HISTORY_BYTES,
-    MAX_TOTAL_TOKENS_PER_RUN,
     _call_with_retry,
     _execute_one_tool,
     _execute_planned_tools,
@@ -26,17 +26,22 @@ from deepseek_mcp.agent_loop import (
     _run_turn,
     run_agent,
 )
+from deepseek_mcp.budget_limits import (
+    DEFAULT_MAX_TOOL_CALLS_PER_RUN,
+    DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+)
 from deepseek_mcp.config import Config
-from deepseek_mcp.provider_child import MAX_API_RESPONSE_BYTES, execute_request
+from deepseek_mcp.provider_child import (
+    MAX_API_RESPONSE_BYTES,
+    _request_arguments,
+    execute_request,
+)
 from deepseek_mcp.provider_process import ProviderRequestDeadline
 from deepseek_mcp.provider_process import _decode_response
+from deepseek_mcp.provider_process import _encoded_request
 from deepseek_mcp.mutation_outcome import mutation_record
 from deepseek_mcp.provider_retry import MutationOutcomeCancelled, MutationOutcomeError
-from deepseek_mcp.resource_budget import (
-    MAX_TOOL_CALLS_PER_RUN,
-    MAX_TOOL_CALLS_PER_TURN,
-    MutationBudget,
-)
+from deepseek_mcp.resource_budget import MutationBudget
 
 
 class _Create:
@@ -135,9 +140,12 @@ def _exception_chain_text(error: BaseException) -> str:
     return "\n".join(parts)
 
 
-def _config() -> Config:
+def _config(**overrides) -> Config:
     return Config(
-        api_key="sk-test", workspace=Path.cwd(), allowed_tools=["Read"]
+        api_key="sk-test",
+        workspace=Path.cwd(),
+        allowed_tools=["Read"],
+        **overrides,
     )
 
 
@@ -145,6 +153,19 @@ def _final_response():
     message = SimpleNamespace(content="done", tool_calls=None)
     return SimpleNamespace(
         usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        choices=[SimpleNamespace(message=message)],
+        model_dump=lambda exclude_none=True: {
+            "choices": [{"message": {"role": "assistant", "content": "done"}}]
+        },
+    )
+
+
+def _usage_response(prompt_tokens: int, completion_tokens: int):
+    message = SimpleNamespace(content="done", tool_calls=None)
+    return SimpleNamespace(
+        usage=SimpleNamespace(
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+        ),
         choices=[SimpleNamespace(message=message)],
         model_dump=lambda exclude_none=True: {
             "choices": [{"message": {"role": "assistant", "content": "done"}}]
@@ -173,9 +194,9 @@ def _tool_response(name: str = "Write", arguments: str = '{}'):
     )
 
 
-def _tool_state(*, tool_calls: int = 0, deadline: float = 10_000.0):
+def _tool_state(*, tool_calls: int = 0, deadline: float = 10_000.0, config=None):
     return SimpleNamespace(
-        config=_config(),
+        config=config or _config(),
         controls=SimpleNamespace(cancel=None, poll=None),
         messages=[],
         execution_lease_fd=None,
@@ -184,6 +205,8 @@ def _tool_state(*, tool_calls: int = 0, deadline: float = 10_000.0):
         deadline=deadline,
         prompt_tokens=0,
         completion_tokens=0,
+        last_prompt_tokens=None,
+        total_completion_tokens=0,
     )
 
 
@@ -195,6 +218,7 @@ class RetryPolicyTests(unittest.TestCase):
             "credential": "placeholder",
             "base_url": "https://api.deepseek.com",
             "model": "deepseek-v4-pro",
+            "max_tokens": 4_096,
         }
 
         with patch("deepseek_mcp.provider_child.OpenAI") as openai:
@@ -203,12 +227,20 @@ class RetryPolicyTests(unittest.TestCase):
             second = execute_request(settings, [], [], 10)
 
         self.assertNotIn("tool_choice", create.kwargs[0])
-        self.assertEqual(create.kwargs[0]["max_tokens"], MAX_OUTPUT_TOKENS_PER_REQUEST)
+        self.assertEqual(create.kwargs[0]["max_tokens"], 4_096)
         self.assertEqual(create.kwargs[0]["tools"], tools)
         self.assertNotIn("tools", create.kwargs[1])
         self.assertNotIn("tool_choice", create.kwargs[1])
         self.assertEqual(first["kind"], "ok")
         self.assertEqual(second["kind"], "ok")
+
+    def test_configured_output_limit_flows_to_provider_request(self) -> None:
+        config = _config(max_output_tokens_per_request=4_321)
+
+        settings = json.loads(_encoded_request(config, [], []))["settings"]
+
+        self.assertEqual(settings["max_tokens"], 4_321)
+        self.assertEqual(_request_arguments(settings, [], [])["max_tokens"], 4_321)
 
     def test_provider_response_is_streamed_under_a_decoded_byte_cap(self) -> None:
         settings = {
@@ -261,22 +293,31 @@ class RetryPolicyTests(unittest.TestCase):
         self.assertEqual(state.messages[0]["reasoning_content"], "private reasoning")
 
     def test_total_token_cap_prevents_another_provider_request(self) -> None:
-        state = _tool_state(deadline=time.monotonic() + 10)
-        state.prompt_tokens = MAX_TOTAL_TOKENS_PER_RUN
+        config = _config(
+            max_total_tokens_per_run=1_000,
+            max_history_tokens=1_000,
+            max_output_tokens_per_request=1_000,
+        )
+        state = _tool_state(deadline=time.monotonic() + 10, config=config)
+        state.last_prompt_tokens = 1_000
         with (
             patch("deepseek_mcp.agent_loop._call_with_retry") as provider,
-            self.assertRaisesRegex(AgentLoopError, "token budget"),
+            self.assertRaisesRegex(BudgetExceededError, "token budget"),
         ):
             _run_turn(state, 1)
         provider.assert_not_called()
 
     def test_near_cap_request_is_rejected_before_provider_cost(self) -> None:
-        state = _tool_state(deadline=time.monotonic() + 10)
-        state.budget_tokens = 200_000
-        state.messages = [{"role": "user", "content": "x" * 800_000}]
+        config = _config(
+            max_total_tokens_per_run=200_000,
+            max_history_tokens=200_000,
+            max_output_tokens_per_request=50_000,
+        )
+        state = _tool_state(deadline=time.monotonic() + 10, config=config)
+        state.last_prompt_tokens = 150_000
         with (
             patch("deepseek_mcp.agent_loop._call_with_retry") as provider,
-            self.assertRaisesRegex(AgentLoopError, "cannot cover"),
+            self.assertRaisesRegex(BudgetExceededError, "cannot cover"),
         ):
             _run_turn(state, 1)
         provider.assert_not_called()
@@ -289,14 +330,61 @@ class RetryPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentLoopError, "missing token usage"):
             _record_response(state, response)
 
-    def test_local_metering_rejects_implausibly_low_provider_usage(self) -> None:
+    def test_large_encoded_history_does_not_inflate_token_budget(self) -> None:
         state = _tool_state(deadline=time.monotonic() + 10)
-        state.messages = [{"role": "user", "content": "x" * 600_000}]
-        response = _final_response()
+        state.last_prompt_tokens = 500
+        state.total_completion_tokens = 200
+        state.messages = [{"role": "user", "content": "x" * 2_000_000}]
+        state.tools = []
+        state.controls = SimpleNamespace(cancel=None, poll=None, finalize=None)
+        state.mutations = SimpleNamespace(
+            recovery_notice=lambda: None,
+            warning_notice=lambda: None,
+            payload=lambda: {"records": 0, "bytes": 0},
+        )
+        state.started = time.time()
+        with patch(
+            "deepseek_mcp.agent_loop._call_with_retry",
+            return_value=_final_response(),
+        ) as provider:
+            result = _run_turn(state, 0)
 
-        _record_response(state, response, request_bytes=600_000)
-        with self.assertRaisesRegex(AgentLoopError, "token budget"):
-            _record_response(state, response, request_bytes=600_000)
+        provider.assert_called_once()
+        self.assertEqual(result["final_message"], "done")
+
+    def test_run_usage_does_not_double_count_prompt_history(self) -> None:
+        config = _config(
+            max_total_tokens_per_run=54_000,
+            max_history_tokens=60_000,
+            max_output_tokens_per_request=1_000,
+        )
+        state = _tool_state(config=config)
+        _record_response(state, _usage_response(50_000, 1_000))
+        _record_response(state, _usage_response(52_000, 1_000))
+
+        self.assertEqual(state.last_prompt_tokens, 52_000)
+        self.assertEqual(state.total_completion_tokens, 2_000)
+        self.assertEqual(
+            state.last_prompt_tokens + state.total_completion_tokens, 54_000
+        )
+
+    def test_run_usage_over_by_one_is_rejected(self) -> None:
+        config = _config(
+            max_total_tokens_per_run=53_999,
+            max_history_tokens=60_000,
+            max_output_tokens_per_request=1_000,
+        )
+        state = _tool_state(config=config)
+        _record_response(state, _usage_response(50_000, 1_000))
+        with self.assertRaisesRegex(
+            BudgetExceededError, "run token budget exceeded"
+        ) as raised:
+            _record_response(state, _usage_response(52_000, 1_000))
+
+        message = str(raised.exception)
+        self.assertIn("used=54000", message)
+        self.assertIn("limit=53999", message)
+        self.assertIn("max_total_tokens_per_run", message)
 
     def test_conversation_history_has_an_independent_byte_cap(self) -> None:
         state = _tool_state(deadline=time.monotonic() + 10)
@@ -305,17 +393,28 @@ class RetryPolicyTests(unittest.TestCase):
         ]
         with (
             patch("deepseek_mcp.agent_loop._call_with_retry") as provider,
-            self.assertRaisesRegex(AgentLoopError, "history budget"),
+            self.assertRaisesRegex(BudgetExceededError, "history budget"),
         ):
             _run_turn(state, 0)
         provider.assert_not_called()
 
     def test_per_turn_tool_call_cap_rejects_entire_batch(self) -> None:
         state = _tool_state()
-        batch = [_tool_call() for _ in range(MAX_TOOL_CALLS_PER_TURN + 1)]
+        batch = [_tool_call() for _ in range(DEFAULT_MAX_TOOL_CALLS_PER_TURN + 1)]
         with (
             patch("deepseek_mcp.agent_loop._execute_one_tool") as execute,
-            self.assertRaisesRegex(AgentLoopError, "per turn"),
+            self.assertRaisesRegex(BudgetExceededError, "per turn"),
+        ):
+            _execute_planned_tools(state, batch, 0)
+        execute.assert_not_called()
+        self.assertEqual(state.tool_calls, 0)
+
+    def test_configured_per_turn_tool_call_cap_is_enforced(self) -> None:
+        state = _tool_state(config=_config(max_tool_calls_per_turn=1))
+        batch = [_tool_call(), _tool_call()]
+        with (
+            patch("deepseek_mcp.agent_loop._execute_one_tool") as execute,
+            self.assertRaisesRegex(BudgetExceededError, "max_tool_calls_per_turn"),
         ):
             _execute_planned_tools(state, batch, 0)
         execute.assert_not_called()
@@ -324,22 +423,64 @@ class RetryPolicyTests(unittest.TestCase):
     def test_steering_cannot_bypass_per_turn_tool_call_cap(self) -> None:
         state = _tool_state()
         state.controls.poll = lambda: ["new direction"]
-        batch = [_tool_call() for _ in range(MAX_TOOL_CALLS_PER_TURN + 1)]
-        with self.assertRaisesRegex(AgentLoopError, "per turn"):
+        batch = [_tool_call() for _ in range(DEFAULT_MAX_TOOL_CALLS_PER_TURN + 1)]
+        with self.assertRaisesRegex(BudgetExceededError, "per turn"):
             _execute_planned_tools(state, batch, 0)
 
         self.assertEqual(state.messages, [])
         self.assertEqual(state.tool_calls, 0)
 
     def test_per_run_tool_call_cap_rejects_entire_cross_turn_batch(self) -> None:
-        state = _tool_state(tool_calls=MAX_TOOL_CALLS_PER_RUN - 1)
+        state = _tool_state(tool_calls=DEFAULT_MAX_TOOL_CALLS_PER_RUN - 1)
         with (
             patch("deepseek_mcp.agent_loop._execute_one_tool") as execute,
-            self.assertRaisesRegex(AgentLoopError, "per run"),
+            self.assertRaisesRegex(BudgetExceededError, "per run"),
         ):
             _execute_planned_tools(state, [_tool_call(), _tool_call()], 4)
         execute.assert_not_called()
-        self.assertEqual(state.tool_calls, MAX_TOOL_CALLS_PER_RUN - 1)
+        self.assertEqual(state.tool_calls, DEFAULT_MAX_TOOL_CALLS_PER_RUN - 1)
+
+    def test_server_returns_specific_budget_message(self) -> None:
+        from deepseek_mcp import server
+
+        message = (
+            "run token budget exceeded: used=53000 limit=52999 "
+            "(config: max_total_tokens_per_run)"
+        )
+        with (
+            patch.object(server, "_deepseek_mode", return_value="auto"),
+            patch.object(server, "_load_config", return_value=_config()),
+            patch.object(
+                server,
+                "_run_sync_cancellable",
+                side_effect=BudgetExceededError(message),
+            ),
+        ):
+            result = asyncio.run(
+                server._delegate("task", "", server.CODING_PROFILE, "flash")
+            )
+
+        self.assertEqual(result, f"ERROR: {message}")
+
+    def test_server_keeps_generic_message_for_non_budget_errors(self) -> None:
+        from deepseek_mcp import server
+
+        with (
+            patch.object(server, "_deepseek_mode", return_value="auto"),
+            patch.object(server, "_load_config", return_value=_config()),
+            patch.object(
+                server,
+                "_run_sync_cancellable",
+                side_effect=AgentLoopError(
+                    "DeepSeek client error on turn 0: category=api"
+                ),
+            ),
+        ):
+            result = asyncio.run(
+                server._delegate("task", "", server.CODING_PROFILE, "flash")
+            )
+
+        self.assertEqual(result, "ERROR: DeepSeek agent loop failed")
 
     def test_mutation_budget_stops_before_over_budget_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

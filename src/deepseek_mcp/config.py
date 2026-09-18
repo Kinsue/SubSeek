@@ -20,6 +20,7 @@ from .budget_limits import (
     DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     DEFAULT_MAX_TOTAL_TOKENS_PER_RUN,
     load_budget_limits,
+    validate_budget_cross_limits,
     validate_budget_limit,
 )
 from .child_runtime import ChildRuntimeError, runtime_is_within_workspace
@@ -409,12 +410,12 @@ class Config:
         self._validate_mutation_runtime()
 
     def _validate_budget_limits(self) -> None:
+        limits: dict = {}
         for key, _env_name, _default, hard_max in BUDGET_LIMIT_FIELDS:
-            setattr(
-                self,
-                key,
-                validate_budget_limit(key, getattr(self, key), hard_max),
-            )
+            value = validate_budget_limit(key, getattr(self, key), hard_max)
+            setattr(self, key, value)
+            limits[key] = value
+        validate_budget_cross_limits(limits)
 
     def _validate_mutation_runtime(self) -> None:
         if not MUTATION_TOOLS.intersection(self.allowed_tools):

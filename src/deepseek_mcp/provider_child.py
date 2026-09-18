@@ -17,11 +17,12 @@ os.environ.pop("OPENAI_LOG", None)
 import httpx
 from openai import APIConnectionError, APIError, OpenAI, RateLimitError
 
+from .budget_limits import DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST
+
 API_CONNECT_TIMEOUT_SECONDS = 15.0
 API_READ_TIMEOUT_SECONDS = 180.0
 API_WRITE_TIMEOUT_SECONDS = 30.0
 API_POOL_TIMEOUT_SECONDS = 30.0
-MAX_OUTPUT_TOKENS_PER_REQUEST = 16_384
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -83,12 +84,17 @@ def _apply_reasoning_settings(arguments: dict[str, Any], effort: object) -> None
 
 
 def _request_arguments(
-    settings: dict[str, str], messages: list[dict], tools: list[dict]
+    settings: dict[str, Any], messages: list[dict], tools: list[dict]
 ) -> dict[str, Any]:
+    max_tokens = settings.get(
+        "max_tokens", DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST
+    )
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
+        raise ValueError("invalid max_tokens setting")
     arguments: dict[str, Any] = {
         "model": settings["model"],
         "messages": messages,
-        "max_tokens": MAX_OUTPUT_TOKENS_PER_REQUEST,
+        "max_tokens": max_tokens,
     }
     if "reasoning_effort" in settings:
         _apply_reasoning_settings(arguments, settings["reasoning_effort"])

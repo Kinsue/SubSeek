@@ -72,7 +72,7 @@ def validate_budget_limit(key: str, value: object, hard_max: int) -> int:
 
 def _load_optional_int_env(env_name: str, hard_max: int) -> int | None:
     raw = os.getenv(env_name)
-    if raw is None:
+    if raw is None or not raw.strip():
         return None
     try:
         value = int(raw)
@@ -83,6 +83,19 @@ def _load_optional_int_env(env_name: str, hard_max: int) -> int | None:
     return value
 
 
+def validate_budget_cross_limits(limits: dict) -> None:
+    """Reject budget combinations whose smaller limit can never be used."""
+    if limits["max_output_tokens_per_request"] > limits["max_total_tokens_per_run"]:
+        raise RuntimeError(
+            "max_output_tokens_per_request must not exceed "
+            "max_total_tokens_per_run"
+        )
+    if limits["max_tool_calls_per_turn"] > limits["max_tool_calls_per_run"]:
+        raise RuntimeError(
+            "max_tool_calls_per_turn must not exceed max_tool_calls_per_run"
+        )
+
+
 def load_budget_limits(data: dict) -> dict:
     limits: dict = {}
     for key, env_name, default, hard_max in BUDGET_LIMIT_FIELDS:
@@ -91,4 +104,5 @@ def load_budget_limits(data: dict) -> dict:
             limits[key] = env_value
         else:
             limits[key] = validate_budget_limit(key, data.get(key, default), hard_max)
+    validate_budget_cross_limits(limits)
     return limits

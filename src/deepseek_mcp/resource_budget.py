@@ -5,9 +5,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Iterator
 
-MAX_TOOL_CALLS_PER_TURN = 32
-MAX_TOOL_CALLS_PER_RUN = 128
-MAX_MUTATION_BYTES_PER_RUN = 64 * 1024 * 1024
+from .budget_limits import (
+    DEFAULT_MAX_MUTATION_BYTES_PER_RUN,
+    DEFAULT_MAX_TOOL_CALLS_PER_RUN,
+    DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+)
 
 
 class ResourceBudgetExceeded(RuntimeError):
@@ -15,8 +17,20 @@ class ResourceBudgetExceeded(RuntimeError):
 
 
 @dataclass
+class ResourceBudget:
+    """Configured per-run resource ceilings carried into the agent loop."""
+
+    per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN
+    per_run: int = DEFAULT_MAX_TOOL_CALLS_PER_RUN
+    mutation_bytes: int = DEFAULT_MAX_MUTATION_BYTES_PER_RUN
+
+    def mutation_budget(self) -> "MutationBudget":
+        return MutationBudget(limit=self.mutation_bytes)
+
+
+@dataclass
 class MutationBudget:
-    limit: int = MAX_MUTATION_BYTES_PER_RUN
+    limit: int = DEFAULT_MAX_MUTATION_BYTES_PER_RUN
     used: int = 0
 
     @contextmanager

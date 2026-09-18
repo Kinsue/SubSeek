@@ -14,9 +14,9 @@ from .child_runtime import (
     isolated_child_argv,
     sanitized_python_environment,
 )
+from .budget_limits import DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST
 from .provider_child import (
     API_READ_TIMEOUT_SECONDS,
-    MAX_OUTPUT_TOKENS_PER_REQUEST,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
 )
@@ -100,6 +100,11 @@ def _encoded_request(config, messages: list[dict], tools: list[dict]) -> bytes:
         "credential": getattr(config, "api_" + "key"),
         "base_url": config.base_url,
         "model": config.model,
+        "max_tokens": getattr(
+            config,
+            "max_output_tokens_per_request",
+            DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST,
+        ),
     }
     reasoning_effort = getattr(config, "reasoning_effort", None)
     if reasoning_effort not in (None, "provider-default"):

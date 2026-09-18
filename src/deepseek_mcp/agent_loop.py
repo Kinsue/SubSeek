@@ -7,6 +7,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+from .budget_limits import (
+    DEFAULT_MAX_MUTATION_BYTES_PER_RUN,
+    DEFAULT_MAX_TOOL_CALLS_PER_RUN,
+    DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+)
 from .config import Config
 from .hard_deadline import Deadline, HardDeadline
 from .mutation_outcome import (
@@ -14,7 +19,6 @@ from .mutation_outcome import (
     MutationRecord,
     mutation_failure_message,
 )
-from .provider_process import MAX_OUTPUT_TOKENS_PER_REQUEST
 from .provider_retry import (
     AgentLoopCancelled,
     AgentLoopError,
@@ -26,18 +30,24 @@ from .provider_retry import (
     MutationOutcomeError,
 )
 from .resource_budget import (
-    MAX_TOOL_CALLS_PER_RUN,
-    MAX_TOOL_CALLS_PER_TURN,
     MutationBudget,
+    ResourceBudget,
     ResourceBudgetExceeded,
+)
+from .token_budget import (
+    BudgetExceededError,
+    BYTES_PER_TOKEN,
+    MAX_PROVIDER_HISTORY_BYTES,
+    check_run_token_budget,
+    config_int,
+    enforce_history_budget,
+    ensure_request_budget,
+    run_usage,
 )
 from .tools import build_tool_schemas, execute_tool
 from .tool_process import execute_in_subprocess
 
 logger = logging.getLogger(__name__)
-
-MAX_TOTAL_TOKENS_PER_RUN = 1_000_000
-MAX_PROVIDER_HISTORY_BYTES = 12 * 1024 * 1024
 
 SYSTEM_PROMPT_TEMPLATE = """You are DeepSeek working as a sub-agent for a parent coding agent.
 
@@ -77,8 +87,10 @@ class _AgentState:
     execution_lease_fd: int | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
-    budget_tokens: int = 0
+    last_prompt_tokens: int | None = None
+    total_completion_tokens: int = 0
     tool_calls: int = 0
+    resource_budget: ResourceBudget = field(default_factory=ResourceBudget)
     mutation_budget: MutationBudget = field(default_factory=MutationBudget)
     mutations: MutationAccumulator = field(default_factory=MutationAccumulator)
 
@@ -142,6 +154,11 @@ def _create_agent_state(
         workspace=config.workspace,
     )
     started = time.time()
+    resource_budget = ResourceBudget(
+        per_turn=config.max_tool_calls_per_turn,
+        per_run=config.max_tool_calls_per_run,
+        mutation_bytes=config.max_mutation_bytes_per_run,
+    )
     return _AgentState(
         config=config,
         tools=tools,
@@ -153,16 +170,17 @@ def _create_agent_state(
         started=started,
         deadline=HardDeadline.after(config.max_run_seconds),
         execution_lease_fd=execution_lease_fd,
+        resource_budget=resource_budget,
+        mutation_budget=resource_budget.mutation_budget(),
     )
 
 
 def _run_turn(state: _AgentState, turn: int) -> dict | None:
     _remaining_seconds(state.deadline)
-    _ensure_token_budget_available(state)
     _check_cancel(state.controls.cancel)
     _append_control_messages(state.messages, state.controls.poll)
-    request_bytes = _enforce_history_budget(state.messages)
-    _ensure_request_budget(state, request_bytes)
+    enforce_history_budget(state)
+    ensure_request_budget(state)
     response = _call_with_retry(
         state.config,
         state.messages,
@@ -171,7 +189,7 @@ def _run_turn(state: _AgentState, turn: int) -> dict | None:
         cancel_signal=state.controls.cancel,
         deadline=state.deadline,
     )
-    message = _record_response(state, response, request_bytes)
+    message = _record_response(state, response)
     _check_cancel(state.controls.cancel)
     if not message.tool_calls:
         return _finalize_or_steer(state, message, turn)
@@ -188,64 +206,57 @@ def _record_response(state: _AgentState, response, request_bytes: int = 0):
     assistant_message = raw["choices"][0]["message"]
     if message.tool_calls and assistant_message.get("content") is None:
         assistant_message["content"] = ""
-    response_bytes = _encoded_size(assistant_message)
-    reported = usage.prompt_tokens + usage.completion_tokens
-    state.prompt_tokens += usage.prompt_tokens
-    state.completion_tokens += usage.completion_tokens
-    state.budget_tokens = getattr(state, "budget_tokens", 0) + max(
-        reported, request_bytes + response_bytes
+    state.prompt_tokens = getattr(state, "prompt_tokens", 0) + usage.prompt_tokens
+    state.completion_tokens = (
+        getattr(state, "completion_tokens", 0) + usage.completion_tokens
     )
-    if max(
-        state.prompt_tokens + state.completion_tokens, state.budget_tokens
-    ) > MAX_TOTAL_TOKENS_PER_RUN:
-        raise AgentLoopError("run token budget exceeded")
+    state.last_prompt_tokens = usage.prompt_tokens
+    state.total_completion_tokens = (
+        getattr(state, "total_completion_tokens", 0) + usage.completion_tokens
+    )
+    check_run_token_budget(state)
     state.messages.append(assistant_message)
-    _enforce_history_budget(state.messages)
+    enforce_history_budget(state)
     return message
 
 
-def _ensure_token_budget_available(state: _AgentState) -> None:
-    metered = max(
-        state.prompt_tokens + state.completion_tokens,
-        getattr(state, "budget_tokens", 0),
+def _resource_budget(state) -> ResourceBudget:
+    existing = getattr(state, "resource_budget", None)
+    if existing is not None:
+        return existing
+    return ResourceBudget(
+        per_turn=config_int(
+            state.config, "max_tool_calls_per_turn", DEFAULT_MAX_TOOL_CALLS_PER_TURN
+        ),
+        per_run=config_int(
+            state.config, "max_tool_calls_per_run", DEFAULT_MAX_TOOL_CALLS_PER_RUN
+        ),
+        mutation_bytes=config_int(
+            state.config,
+            "max_mutation_bytes_per_run",
+            DEFAULT_MAX_MUTATION_BYTES_PER_RUN,
+        ),
     )
-    if metered >= MAX_TOTAL_TOKENS_PER_RUN:
-        raise AgentLoopError("run token budget exhausted")
 
 
-def _ensure_request_budget(state: _AgentState, request_bytes: int) -> None:
-    used = max(
-        state.prompt_tokens + state.completion_tokens,
-        getattr(state, "budget_tokens", 0),
-    )
-    reserved = request_bytes + MAX_OUTPUT_TOKENS_PER_REQUEST
-    if reserved > MAX_TOTAL_TOKENS_PER_RUN - used:
-        raise AgentLoopError("run token budget cannot cover another provider request")
-
-
-def _encoded_size(value: object) -> int:
-    encoder = json.JSONEncoder(separators=(",", ":"), ensure_ascii=True)
-    return sum(len(chunk.encode("utf-8")) for chunk in encoder.iterencode(value))
-
-
-def _enforce_history_budget(messages: list[dict]) -> int:
-    size = _encoded_size(messages)
-    if size > MAX_PROVIDER_HISTORY_BYTES:
-        raise AgentLoopError("provider conversation history budget exceeded")
-    return size
+# Backward-compatible names for the token helpers (defined in token_budget).
+_ensure_request_budget = ensure_request_budget
+_enforce_history_budget = enforce_history_budget
 
 
 def _finalize_or_steer(state: _AgentState, message, turn: int) -> dict | None:
     updates = _poll_control_messages(state.controls.finalize or state.controls.poll)
     if updates:
         _append_steering_update(state.messages, updates)
-        _enforce_history_budget(state.messages)
+        enforce_history_budget(state)
         return None
     return _build_result(state, message.content, turn)
 
 
 def _build_result(state: _AgentState, content: str | None, turn: int) -> dict:
-    total_tokens = state.prompt_tokens + state.completion_tokens
+    last_prompt = getattr(state, "last_prompt_tokens", None) or 0
+    total_completion = getattr(state, "total_completion_tokens", 0)
+    total_tokens = last_prompt + total_completion
     final_message = content or "(empty response)"
     notices = filter(
         None,
@@ -256,8 +267,8 @@ def _build_result(state: _AgentState, content: str | None, turn: int) -> dict:
         "final_message": final_message,
         "turns_used": turn + 1,
         "tokens": {
-            "prompt": state.prompt_tokens,
-            "completion": state.completion_tokens,
+            "prompt": last_prompt,
+            "completion": total_completion,
             "total": total_tokens,
         },
         "tool_calls": state.tool_calls,
@@ -285,7 +296,7 @@ def _execute_planned_tools(state: _AgentState, tool_calls, turn: int) -> None:
 def _steer_before_tools(state: _AgentState, tool_calls, updates: list[str]) -> None:
     _append_skipped_tool_responses(state.messages, tool_calls)
     _append_steering_update(state.messages, updates)
-    _enforce_history_budget(state.messages)
+    enforce_history_budget(state)
 
 
 def _execute_and_record_tool(state: _AgentState, tool_call, turn: int) -> None:
@@ -305,7 +316,7 @@ def _execute_and_record_tool(state: _AgentState, tool_call, turn: int) -> None:
     state.messages.append(
         {"role": "tool", "tool_call_id": tool_call.id, "content": result}
     )
-    _enforce_history_budget(state.messages)
+    enforce_history_budget(state)
     _check_cancel(state.controls.cancel)
 
 
@@ -335,7 +346,13 @@ def _execute_one_tool(
     )
     try:
         if deadline is not None:
-            budget = mutation_budget or MutationBudget()
+            budget = mutation_budget or MutationBudget(
+                limit=config_int(
+                    config,
+                    "max_mutation_bytes_per_run",
+                    DEFAULT_MAX_MUTATION_BYTES_PER_RUN,
+                )
+            )
             return execute_in_subprocess(
                 config,
                 tool_name,
@@ -349,7 +366,7 @@ def _execute_one_tool(
             )
         return execute_tool(tool_name, args, config, **kwargs)
     except ResourceBudgetExceeded as exc:
-        raise AgentLoopError(str(exc)) from None
+        raise BudgetExceededError(str(exc)) from None
 
 
 def _tool_execution_options(execution_lease_fd, mutation_budget, max_bash_timeout):
@@ -363,13 +380,16 @@ def _tool_execution_options(execution_lease_fd, mutation_budget, max_bash_timeou
 
 def _validate_tool_batch(state: _AgentState, tool_calls) -> None:
     planned = len(tool_calls)
-    if planned > MAX_TOOL_CALLS_PER_TURN:
-        raise AgentLoopError(
-            f"tool call batch exceeds {MAX_TOOL_CALLS_PER_TURN} per turn"
+    resource = _resource_budget(state)
+    if planned > resource.per_turn:
+        raise BudgetExceededError(
+            f"tool call batch exceeds {resource.per_turn} per turn "
+            f"(config: max_tool_calls_per_turn, planned={planned})"
         )
-    if state.tool_calls + planned > MAX_TOOL_CALLS_PER_RUN:
-        raise AgentLoopError(
-            f"tool call budget exceeds {MAX_TOOL_CALLS_PER_RUN} per run"
+    if state.tool_calls + planned > resource.per_run:
+        raise BudgetExceededError(
+            f"tool call budget exceeds {resource.per_run} per run "
+            f"(config: max_tool_calls_per_run, used={state.tool_calls + planned})"
         )
 
 

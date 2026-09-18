@@ -19,6 +19,7 @@ from deepseek_mcp.config import (
     _load_data,
     _load_workspace,
 )
+from deepseek_mcp.budget_limits import load_budget_limits
 from deepseek_mcp import windows_file_io
 
 class ConfigTests(unittest.TestCase):
@@ -348,7 +349,7 @@ class BudgetConfigTests(unittest.TestCase):
     def test_budget_defaults_and_valid_file_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)
-            for key, _env_name, default, hard_max in BUDGET_LIMIT_FIELDS:
+            for key, _env_name, default, _hard_max in BUDGET_LIMIT_FIELDS:
                 with self.subTest(key=key):
                     config = Config(
                         "credential", workspace, allowed_tools=["Read"]
@@ -359,10 +360,10 @@ class BudgetConfigTests(unittest.TestCase):
                     )
                     self.assertEqual(getattr(loaded_default, key), default)
                     loaded = Config._from_data(
-                        {"workspace": str(workspace), key: hard_max},
+                        {"workspace": str(workspace), key: default + 1},
                         "credential",
                     )
-                    self.assertEqual(getattr(loaded, key), hard_max)
+                    self.assertEqual(getattr(loaded, key), default + 1)
 
     def test_budget_values_reject_bool_zero_and_hard_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -382,14 +383,68 @@ class BudgetConfigTests(unittest.TestCase):
     def test_budget_env_override_wins_over_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)
-            for key, env_name, _default, _hard_max in BUDGET_LIMIT_FIELDS:
+            for key, env_name, default, _hard_max in BUDGET_LIMIT_FIELDS:
                 with self.subTest(key=key):
-                    with patch.dict(os.environ, {env_name: "2"}, clear=True):
+                    with patch.dict(os.environ, {env_name: str(default)}, clear=True):
                         loaded = Config._from_data(
                             {"workspace": str(workspace), key: 1},
                             "credential",
                         )
-                    self.assertEqual(getattr(loaded, key), 2)
+                    self.assertEqual(getattr(loaded, key), default)
+
+    def test_budget_env_only_override_works_without_file_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            for key, env_name, default, _hard_max in BUDGET_LIMIT_FIELDS:
+                with self.subTest(key=key):
+                    value = default + 1
+                    with patch.dict(os.environ, {env_name: str(value)}, clear=True):
+                        loaded = Config._from_data(
+                            {"workspace": str(workspace)}, "credential"
+                        )
+                    self.assertEqual(getattr(loaded, key), value)
+
+    def test_empty_env_value_is_treated_as_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            for key, env_name, default, _hard_max in BUDGET_LIMIT_FIELDS:
+                with self.subTest(key=key):
+                    with patch.dict(os.environ, {env_name: "   "}, clear=True):
+                        loaded = Config._from_data(
+                            {"workspace": str(workspace)}, "credential"
+                        )
+                    self.assertEqual(getattr(loaded, key), default)
+
+    def test_cross_key_limits_are_rejected_naming_both_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            cases = (
+                (
+                    {
+                        "max_total_tokens_per_run": 100,
+                        "max_output_tokens_per_request": 101,
+                    },
+                    "max_output_tokens_per_request.*max_total_tokens_per_run",
+                ),
+                (
+                    {"max_tool_calls_per_turn": 2, "max_tool_calls_per_run": 1},
+                    "max_tool_calls_per_turn.*max_tool_calls_per_run",
+                ),
+            )
+            for overrides, pattern in cases:
+                with self.subTest(overrides=overrides):
+                    with self.assertRaisesRegex(RuntimeError, pattern):
+                        Config(
+                            "credential",
+                            workspace,
+                            allowed_tools=["Read"],
+                            **overrides,  # type: ignore[arg-type]
+                        )
+                    with (
+                        patch.dict(os.environ, {}, clear=True),
+                        self.assertRaisesRegex(RuntimeError, pattern),
+                    ):
+                        load_budget_limits(overrides)
 
     def test_budget_invalid_env_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
