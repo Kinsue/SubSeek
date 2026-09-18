@@ -357,6 +357,28 @@ Budget errors are transparent: they report the used amount, the configured
 limit, and the config key involved; they reach the host agent instead of a
 generic failure string, and the effective budget set is logged once at startup.
 
+### Parallel agents
+
+Multiple sub-agent jobs run concurrently inside one server process. The pool
+size is set by `max_parallel_agents` (default 16, any positive integer; env
+`DEEPSEEK_MAX_PARALLEL_AGENTS`, empty counts as unset, environment wins over
+the file). The limit applies at admission: when the pool is full, a new job
+is rejected immediately with a listing of the running jobs (id, status,
+capability, task preview) instead of queuing. Running jobs are never evicted,
+so a lowered limit takes effect as the pool drains.
+
+`list_deepseek_jobs(status="")` returns the agent work list — running jobs
+first, then newest first — with job id, status, capability, task preview,
+age, and total tokens for finished jobs. Entries marked `(sync)` are
+in-flight synchronous delegations: they appear in listings but do not accept
+per-job messages.
+
+Coding jobs hold an exclusive cross-process lease on the workspace: a second
+process targeting the same workspace is rejected while any job runs,
+admission fails closed while pending mutation transactions await recovery,
+and if the configured workspace changes while jobs are running, new
+admissions fail closed until the pool drains.
+
 **Workspace root** auto-follows the directory where you launch the host client.
 To lock it to a fixed path regardless of cwd, add `"workspace": "/abs/path"`
 to the config. It is the file-tool path boundary and the working directory for

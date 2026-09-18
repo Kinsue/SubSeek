@@ -8,7 +8,13 @@ from unittest.mock import patch
 
 from deepseek_mcp.agent_loop import AgentLoopCancelled
 from deepseek_mcp.config import Config
-from deepseek_mcp.job_listing import MAX_LIST_LINES, TABLE_HEADER, format_jobs_table
+from deepseek_mcp.job_listing import (
+    MAX_LIST_LINES,
+    MAX_LIST_ROWS,
+    TABLE_HEADER,
+    format_jobs_table,
+    full_pool_message,
+)
 from deepseek_mcp.job_manager import (
     MAX_CONTEXT_BYTES,
     MAX_COMBINED_TASK_BYTES,
@@ -22,6 +28,7 @@ from deepseek_mcp.job_manager import (
     JobError,
     JobRecord,
 )
+from deepseek_mcp.transaction_recovery import TransactionRecoveryError
 
 
 def _result(message: str = "done") -> dict:
@@ -603,6 +610,146 @@ class JobManagerTests(unittest.TestCase):
         bounded = format_jobs_table(manager.list_jobs())
         self.assertLessEqual(len(bounded.splitlines()), MAX_LIST_LINES)
         self.assertIn("[truncated:", bounded)
+
+    def test_workspace_change_while_pool_running_is_rejected(self) -> None:
+        manager = self._manager()
+        release = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            release.wait(2.0)
+            return _result(task)
+
+        other = self.workspace.parent / "other"
+        other.mkdir()
+        config_a = self._config()
+        config_b = self._config(other)
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            first = manager.start("first", "", config_a)
+            with self.assertRaisesRegex(JobError, "workspace") as raised:
+                manager.start("second", "", config_b)
+            message = str(raised.exception)
+            self.assertIn(config_a.expected_workspace_identity, message)
+            self.assertIn(config_b.expected_workspace_identity, message)
+            with self.assertRaisesRegex(JobError, "workspace"):
+                manager.run_sync("second", config_b)
+            same_workspace = manager.start("third", "", config_a)
+            release.set()
+            self._assert_terminal(manager, first["job_id"])
+            self._assert_terminal(manager, same_workspace["job_id"])
+
+    def test_admission_rechecks_pending_transactions_with_cached_lease(self) -> None:
+        manager = self._manager()
+        config = self._config(max_parallel_agents=2)
+        release = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            release.wait(2.0)
+            return _result(task)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            first = manager.start("first", "", config)
+            with patch(
+                "deepseek_mcp.job_manager.require_no_pending",
+                side_effect=TransactionRecoveryError("unacknowledged transactions"),
+            ):
+                with self.assertRaisesRegex(JobError, "unacknowledged"):
+                    manager.start("second", "", config)
+                with self.assertRaisesRegex(JobError, "unacknowledged"):
+                    manager.run_sync("second", config)
+            admitted = manager.start("second", "", config)
+            release.set()
+            self._assert_terminal(manager, first["job_id"])
+            self._assert_terminal(manager, admitted["job_id"])
+
+    def test_run_sync_failure_releases_slot_and_lease(self) -> None:
+        manager = self._manager()
+        config = self._config(max_parallel_agents=1)
+
+        with patch(
+            "deepseek_mcp.job_manager.run_agent", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                manager.run_sync("fail", config)
+
+        self.assertEqual(manager._running, {})
+        self.assertIsNone(manager._lease)
+        self.assertIsNone(manager._lease_identity)
+
+        with patch("deepseek_mcp.job_manager.run_agent", return_value=_result()):
+            job = manager.start("after", "", config)
+            self._assert_terminal(manager, job["job_id"])
+
+    def test_cancel_drain_releases_workspace_lease(self) -> None:
+        manager = self._manager()
+        config = self._config()
+        started = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            started.set()
+            if kwargs["cancel_signal"].wait(2.0):
+                raise AgentLoopCancelled("cancelled in test")
+            return _result("unexpected")
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            job = manager.start("cancel me", "", config)
+            self.assertTrue(started.wait(1.0))
+            manager.cancel(job["job_id"])
+            status = self._assert_terminal(manager, job["job_id"])
+
+        self.assertEqual(status["status"], "cancelled")
+        self.assertEqual(manager._running, {})
+        self.assertIsNone(manager._lease)
+        self.assertIsNone(manager._lease_identity)
+
+    def test_full_pool_message_is_bounded(self) -> None:
+        class _Rec:
+            status = "running"
+            capability = "coding"
+            task_preview = "x"
+            task = ""
+
+        running = {f"job-{index}": _Rec() for index in range(100)}
+        message = full_pool_message(100, running)
+
+        self.assertIn("max_parallel_agents=100", message)
+        self.assertIn("job-0", message)
+        self.assertNotIn(f"job-{MAX_LIST_ROWS}", message)
+        self.assertIn(
+            f"[truncated: {100 - MAX_LIST_ROWS} more running jobs]", message
+        )
+        self.assertLessEqual(len(message.splitlines()), MAX_LIST_LINES)
+
+    def test_sync_slots_are_marked_in_listing_and_pool_message(self) -> None:
+        manager = self._manager()
+        config = self._config(max_parallel_agents=1)
+        started = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+
+        def fake_run_agent(task, config, **kwargs):
+            started.set()
+            release.wait(2.0)
+            return _result(task)
+
+        def run_sync() -> None:
+            try:
+                manager.run_sync("sync task", config)
+            except BaseException as error:
+                errors.append(error)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            thread = threading.Thread(target=run_sync)
+            thread.start()
+            self.assertTrue(started.wait(1.0))
+            with self.assertRaises(JobBusy) as raised:
+                manager.start("overflow", "", config)
+            rows = manager.list_jobs()
+            release.set()
+            thread.join(1.0)
+
+        self.assertIn("(sync)", str(raised.exception))
+        self.assertIn("(sync)", format_jobs_table(rows))
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

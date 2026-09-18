@@ -23,8 +23,15 @@ from .agent_loop import (
     run_agent,
 )
 from .config import Config
-from .job_listing import full_pool_message, list_rows, prune_records, task_preview
-from .mutation_outcome import mutation_failure_message, records_from_result
+from .job_listing import (
+    JobOutcome,
+    apply_cancelled_outcome,
+    full_pool_message,
+    list_rows,
+    prune_records,
+    task_preview,
+    workspace_mismatch_message,
+)
 from .provider_retry import MutationOutcomeError
 from .transaction_recovery import TransactionRecoveryError, require_no_pending
 from .execution_lock import (
@@ -42,7 +49,6 @@ MAX_COMBINED_TASK_BYTES = MAX_TASK_BYTES + MAX_CONTEXT_BYTES + 64
 MAX_STEERING_MESSAGE_BYTES = 64 * 1024
 MAX_QUEUED_MESSAGES = 32
 MAX_QUEUED_MESSAGE_BYTES = 256 * 1024
-CANCELLED_ERROR = "DeepSeek job cancelled by parent agent"
 
 logger = logging.getLogger(__name__)
 
@@ -140,17 +146,9 @@ class JobRecord:
             self._queued_message_bytes = 0
 
 
-@dataclass(frozen=True)
-class _JobOutcome:
-    status: str
-    result: dict[str, Any] | None
-    error: str | None
-    preserve_mutation_error: bool = False
-
-
 def _run_background_agent(
     task: str, config: Config, job: JobRecord, lease: WorkspaceExecutionLease,
-) -> _JobOutcome:
+) -> JobOutcome:
     try:
         result = run_agent(
             task,
@@ -162,28 +160,15 @@ def _run_background_agent(
         )
     except MutationOutcomeError as error:
         status = "cancelled" if isinstance(error, AgentLoopCancelled) else "failed"
-        return _JobOutcome(status, None, str(error), True)
+        return JobOutcome(status, None, str(error), True)
     except AgentLoopCancelled as error:
-        return _JobOutcome("cancelled", None, str(error))
+        return JobOutcome("cancelled", None, str(error))
     except AgentLoopError as error:
-        return _JobOutcome("failed", None, str(error))
+        return JobOutcome("failed", None, str(error))
     except Exception:
         logger.error("DeepSeek background job failed category=internal")
-        return _JobOutcome("failed", None, "unexpected internal failure")
-    return _JobOutcome("completed", result, None)
-
-
-def _apply_cancelled_outcome(job: JobRecord, outcome: _JobOutcome) -> None:
-    records = records_from_result(outcome.result)
-    job.cancel_event.set()
-    job.status = "cancelled"
-    job.result = None
-    if records:
-        job.error = mutation_failure_message(records, CANCELLED_ERROR)
-    elif outcome.preserve_mutation_error:
-        job.error = outcome.error
-    else:
-        job.error = outcome.error if outcome.status == "cancelled" else CANCELLED_ERROR
+        return JobOutcome("failed", None, "unexpected internal failure")
+    return JobOutcome("completed", result, None)
 
 
 def _bounded_text_bytes(
@@ -217,6 +202,7 @@ class DeepSeekJobManager:
         self._jobs: dict[str, JobRecord] = {}
         self._running: dict[str, JobRecord] = {}
         self._lease: WorkspaceExecutionLease | None = None
+        self._lease_identity: str | None = None
         self._lock_directory = lock_directory
 
     def run_sync(
@@ -244,7 +230,9 @@ class DeepSeekJobManager:
                 started_at=time.time(),
             )
             lease = self._lease
-        assert lease is not None
+            if lease is None:
+                self._running.pop(slot_id, None)
+                raise JobError("workspace execution lease is unavailable")
         try:
             return run_agent(
                 task,
@@ -388,24 +376,27 @@ class DeepSeekJobManager:
         return job.task_length, job.result
 
     def _run_job(self, job_id: str, config: Config) -> None:
-        with self._lock:
-            job = self._get_locked(job_id)
-            full_task = job.task
-            if job.context:
-                full_task = f"{job.task}\n\n# Additional context\n{job.context}"
-            # Do not retain full task/context/config secrets longer than needed in
-            # the manager's persistent job record. Keep only a short usage summary.
-            job.task = ""
-            job.context = ""
-            lease = self._lease
-        assert lease is not None
-        outcome = _run_background_agent(full_task, config, job, lease)
+        try:
+            with self._lock:
+                job = self._get_locked(job_id)
+                full_task = job.task
+                if job.context:
+                    full_task = f"{job.task}\n\n# Additional context\n{job.context}"
+                # Do not retain full task/context/config secrets longer than needed
+                # in the persistent job record. Keep a short usage summary plus
+                # task_preview (80 chars, same-host visibility only).
+                job.task = ""
+                job.context = ""
+                lease = self._lease
+            if lease is None:
+                raise JobError("workspace execution lease is unavailable")
+            outcome = _run_background_agent(full_task, config, job, lease)
+        except BaseException:
+            logger.error("DeepSeek background job crashed category=internal")
+            outcome = JobOutcome("failed", None, "unexpected internal failure")
         self._finish_job(
-            job_id,
-            desired_status=outcome.status,
-            result=outcome.result,
-            error=outcome.error,
-            preserve_mutation_error=outcome.preserve_mutation_error,
+            job_id, desired_status=outcome.status, result=outcome.result,
+            error=outcome.error, preserve_mutation_error=outcome.preserve_mutation_error,
         )
 
     def _finish_job(
@@ -422,9 +413,9 @@ class DeepSeekJobManager:
             job = self._get_locked(job_id)
             cancellation_won = job.cancel_event.is_set() or desired_status == "cancelled"
             if cancellation_won:
-                _apply_cancelled_outcome(
+                apply_cancelled_outcome(
                     job,
-                    _JobOutcome(
+                    JobOutcome(
                         desired_status, result, error, preserve_mutation_error
                     ),
                 )
@@ -478,13 +469,23 @@ class DeepSeekJobManager:
             raise JobBusy(full_pool_message(limit, self._running))
 
     def _ensure_lease_locked(self, config: Config) -> None:
+        identity = config.expected_workspace_identity
         if self._lease is None:
             self._lease = self._acquire_ready_workspace_lease_locked(config)
+            self._lease_identity = identity
+        elif identity != self._lease_identity:
+            raise JobError(workspace_mismatch_message(self._lease_identity, identity))
+        else:
+            try:
+                require_no_pending(config)
+            except TransactionRecoveryError as error:
+                raise JobError(str(error)) from None
 
     def _release_lease_if_idle_locked(self) -> None:
         if self._running or self._lease is None:
             return
         lease, self._lease = self._lease, None
+        self._lease_identity = None
         self._release_workspace_lease_locked(lease)
 
     def _get_locked(self, job_id: str) -> JobRecord:
