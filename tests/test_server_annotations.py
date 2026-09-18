@@ -77,7 +77,7 @@ class ServerAnnotationTests(unittest.TestCase):
             patch.object(server, "pending_snapshot", return_value=snapshot),
             patch.object(
                 server,
-                "acknowledge_with_lease",
+                "acknowledge_pending",
                 return_value=(["a" * 32], []),
             ),
             patch.object(server.Config, "load") as provider_load,
@@ -96,6 +96,40 @@ class ServerAnnotationTests(unittest.TestCase):
         prefix = server._HOST_INSTRUCTIONS[:512]
         self.assertIn("get_deepseek_recovery", prefix)
         self.assertIn("acknowledge_deepseek_mutations", prefix)
+
+    def test_sync_delegate_surfaces_overlap_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = Config("sk-test", root, allowed_tools=["Read"])
+            manager = DeepSeekJobManager(lock_directory=root / "locks")
+            started = threading.Event()
+            release = threading.Event()
+            result = {
+                "final_message": "done", "turns_used": 1, "tool_calls": 0,
+                "tokens": {"prompt": 1, "completion": 1, "total": 2},
+                "duration_seconds": 0.01,
+            }
+
+            def fake_run_agent(task, config, **kwargs):
+                if task.startswith("occupier"):
+                    started.set()
+                    release.wait(2.0)
+                return result
+
+            with (
+                patch.object(server, "job_manager", manager),
+                patch.object(server.Config, "load", return_value=config),
+                patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent),
+                patch.object(server, "_record_usage", return_value=True),
+            ):
+                occupier = manager.start("occupier task", "", config)
+                self.assertTrue(started.wait(1.0))
+                text = asyncio.run(server.delegate_to_deepseek("second task"))
+                release.set()
+                self.assertTrue(manager.wait_for_terminal(occupier["job_id"], 2.0))
+
+        self.assertIn("overlap notice", text)
+        self.assertIn(occupier["job_id"], text)
 
     def test_background_usage_claim_is_released_when_persistence_fails(self) -> None:
         result = {

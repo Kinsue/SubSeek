@@ -28,6 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from . import __version__
+from .admission import format_sync_result
 from .agent_catalog import bind_agent, refresh_registered_tool_descriptions, register_agent_tool
 from .agent_loop import AgentLoopCancelled, AgentLoopError
 from .token_budget import bounded_budget_message, is_budget_error, log_effective_budgets
@@ -44,7 +45,7 @@ from .model_selection import ModelChoice, resolve_profile
 from .private_logging import PrivateBoundedLogStream
 from .process_hardening import disable_core_dumps
 from .transaction_recovery import (
-    TransactionRecoveryError, acknowledge_with_lease,
+    TransactionRecoveryError, acknowledge_pending,
     load_recovery_config, pending_snapshot,
 )
 from .worktrees import build_tools as build_worktree_tools
@@ -206,7 +207,7 @@ def get_deepseek_recovery() -> str:
 def acknowledge_deepseek_mutations(transaction_ids: list[str]) -> str:
     """Acknowledge exact transaction IDs after the host verifies their files."""
     try:
-        removed, pending = acknowledge_with_lease(
+        removed, pending = acknowledge_pending(
             load_recovery_config(), transaction_ids, status_resolver=job_manager.job_status
         )
     except (RuntimeError, TransactionRecoveryError) as error:
@@ -247,17 +248,6 @@ def _load_config(profile: ExecutionProfile = CODING_PROFILE, model: ModelChoice 
         raise
     except Exception as e:
         raise JobError(f"deepseek-mcp not configured: {e}") from e
-
-
-def _format_sync_result(result: dict) -> str:
-    return (
-        f"{result['final_message']}\n\n"
-        f"---\n"
-        f"[deepseek-mcp] {result['turns_used']} turns, "
-        f"{result['tool_calls']} tool calls, "
-        f"{result['tokens']['total']} tokens, "
-        f"{result['duration_seconds']}s"
-    )
 
 
 def _build_full_task(task: str, context: str) -> str:
@@ -330,7 +320,7 @@ async def _delegate(task: str, context: str, profile: ExecutionProfile, model: M
 
     _log_sync_completion(result)
     _record_usage(len(task), result)
-    return _format_sync_result(result)
+    return format_sync_result(result)
 
 async def delegate_to_deepseek(task: str, context: str = "", model: ModelChoice = "flash", agent: str = "", workspace: str = "") -> str:
     return await _delegate(task, context, CODING_PROFILE, model, agent, workspace)

@@ -68,7 +68,7 @@ Rules:
    skip the file, or report and stop. Don't blindly loop on the same error.
 {advisory}"""
 
-CONCURRENCY_ADVISORY = """7. Other agents may edit this workspace concurrently. Scope edits to your task.
+CONCURRENCY_ADVISORY = """Concurrency: other agents may edit this workspace concurrently. Scope edits to your task.
    If an Edit fails its expected-identity check because the file changed underneath,
    re-read the file and re-apply your change; never force or loop blindly.
 """

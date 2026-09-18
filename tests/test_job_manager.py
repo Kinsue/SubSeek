@@ -1150,6 +1150,32 @@ class JobManagerTests(unittest.TestCase):
         self.assertEqual(child.job_id, job["job_id"])
         self.assertEqual(child.job_started_at, config.job_started_at)
 
+    def test_allow_mode_respects_in_process_exclusive_holder(self) -> None:
+        manager = self._manager()
+        exclusive = self._config(same_workspace_writers="exclusive")
+        allow = self._config()  # default allow, same workspace identity
+        readonly = self._config(delegation_capability="readonly")
+        release = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            release.wait(2.0)
+            return _result(task)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            held = manager.start("writer", "", exclusive)
+            with self.assertRaises(JobBusy):
+                manager.start("joiner coding", "", allow)
+            with self.assertRaises(JobBusy):
+                manager.start("joiner readonly", "", readonly)
+            release.set()
+            self._assert_terminal(manager, held["job_id"])
+
+            release.clear()
+            joined = manager.start("after drain", "", allow)
+            self.assertEqual(self._mode(manager, allow), LEASE_SHARED)
+            release.set()
+            self._assert_terminal(manager, joined["job_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

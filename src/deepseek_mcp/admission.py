@@ -13,7 +13,7 @@ from .budget_limits import (
     DEFAULT_SAME_WORKSPACE_WRITERS,
     SAME_WORKSPACE_WRITERS_EXCLUSIVE,
 )
-from .job_listing import lease_conflict_message, task_preview
+from .job_listing import LEASE_EXCLUSIVE, lease_conflict_message, task_preview
 from .transaction_journal import TransactionJournalError, pending_total
 from .transaction_recovery import (
     TransactionRecoveryError,
@@ -22,6 +22,7 @@ from .transaction_recovery import (
 )
 
 MAX_OVERLAP_LINES = 8
+MAX_SIGNAL_CHARS = 1200
 
 
 @dataclass(frozen=True)
@@ -95,13 +96,19 @@ def admission_plan(config: Any, current_mode: str | None, running: Mapping[str, 
     conflict = None
     recovery = None
     extras: dict[str, Any] = {}
+    # An EX entry must stay single-writer even if the incoming call is allow-mode.
+    if current_mode is not None and (
+        mode == SAME_WORKSPACE_WRITERS_EXCLUSIVE or current_mode == LEASE_EXCLUSIVE
+    ):
+        conflict = lease_conflict_message(
+            _identity_running(running, identity), current_mode, capability
+        )
     if mode == SAME_WORKSPACE_WRITERS_EXCLUSIVE:
-        if current_mode is not None:
-            conflict = lease_conflict_message(
-                _identity_running(running, identity), current_mode, capability
-            )
         recovery = require_no_pending
     else:
+        # Journal reads here are bounded (<=128 records), matching the old
+        # exclusive gate's cost; cache per identity at drain transitions if it
+        # ever shows up in profiles.
         notice = overlap_notice(running, identity, capability)
         if notice is not None:
             extras["overlap_notice"] = notice
@@ -114,6 +121,28 @@ def admission_plan(config: Any, current_mode: str | None, running: Mapping[str, 
         conflict,
         extras,
     )
+
+
+def format_sync_result(result: dict[str, Any]) -> str:
+    """Format a sync delegation result plus bounded admission signals."""
+    text = (
+        f"{result['final_message']}\n\n"
+        f"---\n"
+        f"[deepseek-mcp] {result['turns_used']} turns, "
+        f"{result['tool_calls']} tool calls, "
+        f"{result['tokens']['total']} tokens, "
+        f"{result['duration_seconds']}s"
+    )
+    notice = result.get("overlap_notice")
+    if notice:
+        text += f"\n\n[deepseek-mcp] {str(notice)[:MAX_SIGNAL_CHARS]}"
+    pending = result.get("pending_recovery")
+    if isinstance(pending, dict) and pending.get("count"):
+        text += (
+            f"\n\n[deepseek-mcp] {pending['count']} pending mutation records "
+            "await recovery (see get_deepseek_recovery)"
+        )
+    return text
 
 
 def pending_badges(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -33,7 +33,7 @@ def load_recovery_config() -> Config:
 
 
 def require_no_pending(config: Config) -> None:
-    """Fail closed while the caller owns the workspace execution lease."""
+    """Fail closed in exclusive writer mode when unacknowledged mutations exist."""
     records = _pending(config)
     if not records:
         return
@@ -45,14 +45,14 @@ def require_no_pending(config: Config) -> None:
     )
 
 
-def query_with_lease(
+def query_pending(
     config: Config, lock_directory: Path | None = None,
 ) -> list[dict[str, object]]:
-    """List pending records; the journal flock is the only lock (no lease)."""
+    """List pending records; the journal flock is the only lock."""
     return _pending(config)
 
 
-def acknowledge_with_lease(
+def acknowledge_pending(
     config: Config, transaction_ids: list[str],
     lock_directory: Path | None = None, *, status_resolver=None,
 ) -> tuple[list[str], list[dict[str, object]]]:
@@ -65,6 +65,11 @@ def acknowledge_with_lease(
             "transaction acknowledgement failed safely"
         ) from None
     return removed, _pending(config)
+
+
+# Backward-compatible names: recovery no longer touches the workspace lease.
+query_with_lease = query_pending
+acknowledge_with_lease = acknowledge_pending
 
 
 def pending_snapshot(config: Config, status_resolver=None) -> dict[str, object]:
