@@ -301,6 +301,38 @@ MCP API 会在加载配置后应用各自固定的 profile。
 同步委派时，MCP 客户端自身的 tool timeout 必须至少是运行上限再加清理
 余量；Codex 安装后的默认值是 18,060 秒（5 小时加 60 秒）。
 
+### 预算
+
+六个预算键约束单次委派可消耗的资源。全部可选；默认值与旧版内置上限
+一致，每个键接受 `1` 到各自的硬上限：
+
+| 键 | 默认值 | 硬上限 | 约束内容 |
+|---|---|---|---|
+| `max_total_tokens_per_run` | 1,000,000 | 8,000,000 | 单次运行可消耗的总 token（最近一次 prompt + 累计 completion） |
+| `max_history_tokens` | 98,304 | 1,048,576 | 发送给 provider 的会话历史（按 token 计） |
+| `max_output_tokens_per_request` | 16,384 | 65,536 | 单次 provider 请求的 completion token 数 |
+| `max_tool_calls_per_turn` | 32 | 256 | 单轮工具调用数 |
+| `max_tool_calls_per_run` | 128 | 1,024 | 整次运行的工具调用总数 |
+| `max_mutation_bytes_per_run` | 67,108,864（64 MiB） | 1,073,741,824（1 GiB） | 整次运行通过可变工具写入的字节数 |
+
+token 记账基于 provider 用量：运行预算按最近一次请求上报的 prompt_tokens
+加累计 completion_tokens 计算，长会话不会再提前触发预算。首次 provider
+响应之前、以及历史检查在下一响应到来之前，会按消息字节数保守估算
+（约 4 字节/token）；接近上限的密集内容任务仍可能被 provider 拒绝而不是
+在本地拦截。12 MiB 的原始请求字节传输守卫保持内部固定不变。
+
+跨键规则：`max_output_tokens_per_request` 不得超过 `max_total_tokens_per_run`，
+`max_tool_calls_per_turn` 不得超过 `max_tool_calls_per_run`。
+
+每个键都可用同名 `DEEPSEEK_MAX_*` 环境变量在运行时覆盖（例如
+`DEEPSEEK_MAX_TOOL_CALLS_PER_RUN=256`）；空变量视为未设置，环境变量
+优先于配置文件。`max_turns` 和 `max_run_seconds` 仅支持文件配置。超过
+当前模型上下文窗口的取值在这里会被接受，但会在 provider 侧以 4xx 失败 ——
+provider 始终是最终裁决者。
+
+预算错误完全透明：包含已用量、配置上限和所涉配置键；错误会直接返回给
+宿主 agent 而不是笼统的失败文案；生效的预算集合会在启动时记录一次日志。
+
 **工作区根目录**默认跟随启动宿主客户端时的当前目录。它是文件工具的路径边界，
 也是 coding Bash 的工作目录；对 `trusted_host` Bash 而言它不是操作系统级沙箱。
 要锁定固定路径，可加：
@@ -309,7 +341,7 @@ MCP API 会在加载配置后应用各自固定的 profile。
 "workspace": "/abs/path"
 ```
 
-运行时可用环境变量覆盖：`DEEPSEEK_API_KEY`、`DEEPSEEK_WORKSPACE`、`DEEPSEEK_MODE=off`。
+运行时可用环境变量覆盖：`DEEPSEEK_API_KEY`、`DEEPSEEK_WORKSPACE`、`DEEPSEEK_MODE=off`，以及逐键的 `DEEPSEEK_MAX_*` 预算覆盖（见[预算](#预算)）。
 
 `delegate_to_deepseek` 与 `start_deepseek` 固定使用完整 coding 工具和有界
 `trusted_host` Bash。`delegate_to_deepseek_readonly` 与

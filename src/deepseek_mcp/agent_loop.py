@@ -85,8 +85,6 @@ class _AgentState:
     started: float
     deadline: Deadline
     execution_lease_fd: int | None = None
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
     last_prompt_tokens: int | None = None
     total_completion_tokens: int = 0
     tool_calls: int = 0
@@ -197,7 +195,7 @@ def _run_turn(state: _AgentState, turn: int) -> dict | None:
     return None
 
 
-def _record_response(state: _AgentState, response, request_bytes: int = 0):
+def _record_response(state: _AgentState, response):
     usage = response.usage
     if usage is None:
         raise AgentLoopError("provider response is missing token usage")
@@ -206,10 +204,6 @@ def _record_response(state: _AgentState, response, request_bytes: int = 0):
     assistant_message = raw["choices"][0]["message"]
     if message.tool_calls and assistant_message.get("content") is None:
         assistant_message["content"] = ""
-    state.prompt_tokens = getattr(state, "prompt_tokens", 0) + usage.prompt_tokens
-    state.completion_tokens = (
-        getattr(state, "completion_tokens", 0) + usage.completion_tokens
-    )
     state.last_prompt_tokens = usage.prompt_tokens
     state.total_completion_tokens = (
         getattr(state, "total_completion_tokens", 0) + usage.completion_tokens
@@ -237,11 +231,6 @@ def _resource_budget(state) -> ResourceBudget:
             DEFAULT_MAX_MUTATION_BYTES_PER_RUN,
         ),
     )
-
-
-# Backward-compatible names for the token helpers (defined in token_budget).
-_ensure_request_budget = ensure_request_budget
-_enforce_history_budget = enforce_history_budget
 
 
 def _finalize_or_steer(state: _AgentState, message, turn: int) -> dict | None:
@@ -389,7 +378,8 @@ def _validate_tool_batch(state: _AgentState, tool_calls) -> None:
     if state.tool_calls + planned > resource.per_run:
         raise BudgetExceededError(
             f"tool call budget exceeds {resource.per_run} per run "
-            f"(config: max_tool_calls_per_run, used={state.tool_calls + planned})"
+            f"(config: max_tool_calls_per_run, used={state.tool_calls} "
+            f"planned={planned})"
         )
 
 

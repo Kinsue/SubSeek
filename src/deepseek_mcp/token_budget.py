@@ -42,6 +42,10 @@ _MAX_ERROR_MESSAGE_CHARS = 500
 
 
 def is_budget_error(error: BaseException) -> bool:
+    # The substring half deliberately nets budget-class errors that cross a
+    # subprocess boundary and lose their BudgetExceededError type. The message
+    # surface reaching server.py is fixed internal strings, so keep this as-is;
+    # do not widen it or "simplify" it to isinstance-only.
     return isinstance(error, BudgetExceededError) or "budget" in str(error).lower()
 
 
@@ -55,7 +59,8 @@ def log_effective_budgets(log) -> None:
         from .config import Config
 
         config = Config.load()
-    except Exception:
+    except Exception as error:
+        log.debug("effective budgets unavailable: %s", type(error).__name__)
         return
     log.info(
         "effective budgets: %s",
@@ -68,11 +73,11 @@ def config_int(source, key: str, default: int) -> int:
 
 
 def run_usage(state) -> int:
+    # History is append-only (no compaction/truncation), so the most recent
+    # reported prompt_tokens is monotone and run_usage can never undercount.
+    # If context compaction is ever added, this accounting must be revisited.
     last_prompt = getattr(state, "last_prompt_tokens", None) or 0
-    total_completion = getattr(
-        state, "total_completion_tokens", getattr(state, "completion_tokens", 0)
-    )
-    return last_prompt + total_completion
+    return last_prompt + state.total_completion_tokens
 
 
 def encoded_size(value: object) -> int:
@@ -118,6 +123,12 @@ def ensure_request_budget(state) -> None:
 
 
 def enforce_history_budget(state) -> int:
+    """Reject oversized history before the next provider request.
+
+    The token check lags one round-trip by design: it compares the previous
+    request's reported prompt_tokens, so messages appended since then are caught
+    on the next round, or bounded meanwhile by the exact byte guard below.
+    """
     size = encoded_size(state.messages)
     if size > MAX_PROVIDER_HISTORY_BYTES:
         raise BudgetExceededError(

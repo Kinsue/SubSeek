@@ -312,6 +312,44 @@ For synchronous delegation, the MCP client's tool timeout must be at least the
 configured run limit plus cleanup grace; Codex installs with an 18,060-second
 default (five hours plus 60 seconds).
 
+### Budgets
+
+Six budget keys bound what one delegated run may consume. All are optional;
+defaults match the previous built-in limits, and each accepts `1` up to its
+hard maximum:
+
+| key | default | hard max | bounds |
+|---|---|---|---|
+| `max_total_tokens_per_run` | 1,000,000 | 8,000,000 | tokens one run may consume (latest prompt + cumulative completion) |
+| `max_history_tokens` | 98,304 | 1,048,576 | conversation history sent to the provider, in tokens |
+| `max_output_tokens_per_request` | 16,384 | 65,536 | completion tokens per provider request |
+| `max_tool_calls_per_turn` | 32 | 256 | tool calls in one turn |
+| `max_tool_calls_per_run` | 128 | 1,024 | tool calls across one run |
+| `max_mutation_bytes_per_run` | 67,108,864 (64 MiB) | 1,073,741,824 (1 GiB) | bytes written through mutating tools |
+
+Token accounting is usage-based: the run budget counts the provider-reported
+prompt tokens of the latest request plus cumulative completion tokens, so long
+sessions no longer trip the budget early. Before the first provider response —
+and for the history check until the next response arrives — sizes are
+conservatively estimated from message bytes (~4 bytes/token), so dense-content
+tasks near the caps may still be rejected by the provider rather than locally.
+A 12 MiB transport guard on raw request bytes remains internal and fixed.
+
+Cross-key rules: `max_output_tokens_per_request` must not exceed
+`max_total_tokens_per_run`, and `max_tool_calls_per_turn` must not exceed
+`max_tool_calls_per_run`.
+
+Each key can be overridden at runtime with a `DEEPSEEK_MAX_*` environment
+variable of the same name (for example `DEEPSEEK_MAX_TOOL_CALLS_PER_RUN=256`);
+an empty variable counts as unset, and the environment wins over the file.
+`max_turns` and `max_run_seconds` remain file-only. Values above the active
+model's context window are accepted here but fail at the provider with a 4xx —
+the provider stays the final authority.
+
+Budget errors are transparent: they report the used amount, the configured
+limit, and the config key involved; they reach the host agent instead of a
+generic failure string, and the effective budget set is logged once at startup.
+
 **Workspace root** auto-follows the directory where you launch the host client.
 To lock it to a fixed path regardless of cwd, add `"workspace": "/abs/path"`
 to the config. It is the file-tool path boundary and the working directory for
@@ -324,7 +362,7 @@ The selected API—not a task argument or model request—freezes that capabilit
 for the job lifetime.
 See [SECURITY.md](SECURITY.md) for boundaries and platform limitations.
 
-Override at runtime with env vars: `DEEPSEEK_API_KEY`, `DEEPSEEK_WORKSPACE`, `DEEPSEEK_MODE=off`.
+Override at runtime with env vars: `DEEPSEEK_API_KEY`, `DEEPSEEK_WORKSPACE`, `DEEPSEEK_MODE=off`, plus the per-key `DEEPSEEK_MAX_*` budget overrides (see [Budgets](#budgets)).
 
 ## Uninstall
 

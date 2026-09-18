@@ -19,11 +19,13 @@ from deepseek_mcp.agent_loop import (
     AgentLoopError,
     BudgetExceededError,
     MAX_PROVIDER_HISTORY_BYTES,
+    _build_result,
     _call_with_retry,
     _execute_one_tool,
     _execute_planned_tools,
     _record_response,
     _run_turn,
+    enforce_history_budget,
     run_agent,
 )
 from deepseek_mcp.budget_limits import (
@@ -194,6 +196,16 @@ def _tool_response(name: str = "Write", arguments: str = '{}'):
     )
 
 
+def _mutations_stub():
+    return SimpleNamespace(
+        recovery_notice=lambda: None,
+        warning_notice=lambda: None,
+        payload=lambda: [],
+        add=lambda _record: None,
+        records=[],
+    )
+
+
 def _tool_state(*, tool_calls: int = 0, deadline: float = 10_000.0, config=None):
     return SimpleNamespace(
         config=config or _config(),
@@ -203,8 +215,6 @@ def _tool_state(*, tool_calls: int = 0, deadline: float = 10_000.0, config=None)
         mutation_budget=MutationBudget(),
         tool_calls=tool_calls,
         deadline=deadline,
-        prompt_tokens=0,
-        completion_tokens=0,
         last_prompt_tokens=None,
         total_completion_tokens=0,
     )
@@ -385,6 +395,38 @@ class RetryPolicyTests(unittest.TestCase):
         self.assertIn("used=54000", message)
         self.assertIn("limit=53999", message)
         self.assertIn("max_total_tokens_per_run", message)
+
+    def test_history_token_budget_uses_reported_prompt_tokens(self) -> None:
+        state = _tool_state()
+        state.last_prompt_tokens = 99_000
+        state.messages = [{"role": "user", "content": "small history"}]
+        with self.assertRaisesRegex(
+            BudgetExceededError, "history budget"
+        ) as raised:
+            enforce_history_budget(state)
+
+        message = str(raised.exception)
+        self.assertIn("tokens=99000", message)
+        self.assertIn("limit=98304", message)
+        self.assertIn("max_history_tokens", message)
+
+    def test_build_result_reports_last_prompt_not_summed_history(self) -> None:
+        config = _config(
+            max_total_tokens_per_run=60_000,
+            max_history_tokens=60_000,
+            max_output_tokens_per_request=1_000,
+        )
+        state = _tool_state(config=config)
+        state.mutations = _mutations_stub()
+        state.started = time.time()
+        _record_response(state, _usage_response(50_000, 1_000))
+        _record_response(state, _usage_response(52_000, 1_000))
+
+        result = _build_result(state, "done", 1)
+
+        self.assertEqual(result["tokens"]["prompt"], 52_000)
+        self.assertEqual(result["tokens"]["completion"], 2_000)
+        self.assertEqual(result["tokens"]["total"], 54_000)
 
     def test_conversation_history_has_an_independent_byte_cap(self) -> None:
         state = _tool_state(deadline=time.monotonic() + 10)
