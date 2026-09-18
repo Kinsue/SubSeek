@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from deepseek_mcp.agent_loop import AgentLoopCancelled
 from deepseek_mcp.config import Config
+from deepseek_mcp.job_listing import MAX_LIST_LINES, TABLE_HEADER, format_jobs_table
 from deepseek_mcp.job_manager import (
     MAX_CONTEXT_BYTES,
     MAX_COMBINED_TASK_BYTES,
@@ -45,8 +46,10 @@ class JobManagerTests(unittest.TestCase):
     def _manager(self) -> DeepSeekJobManager:
         return DeepSeekJobManager(lock_directory=self.lock_directory)
 
-    def _config(self, workspace: Path | None = None) -> Config:
-        return Config(api_key="sk-test", workspace=workspace or self.workspace)
+    def _config(self, workspace: Path | None = None, **overrides) -> Config:
+        return Config(
+            api_key="sk-test", workspace=workspace or self.workspace, **overrides
+        )
 
     def _assert_terminal(self, manager: DeepSeekJobManager, job_id: str) -> dict:
         self.assertTrue(manager.wait_for_terminal(job_id, 2.0))
@@ -225,6 +228,7 @@ class JobManagerTests(unittest.TestCase):
 
     def test_only_one_background_job_can_run(self) -> None:
         manager = self._manager()
+        config = self._config(max_parallel_agents=1)
         started = threading.Event()
         release = threading.Event()
 
@@ -235,12 +239,12 @@ class JobManagerTests(unittest.TestCase):
             return _result()
 
         with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
-            first = manager.start("first", "", self._config())
+            first = manager.start("first", "", config)
             self.assertTrue(started.wait(1.0))
             with self.assertRaises(JobBusy):
-                manager.start("second", "", self._config())
+                manager.start("second", "", config)
             with self.assertRaises(JobBusy):
-                manager.run_sync("sync", self._config())
+                manager.run_sync("sync", config)
             release.set()
             self._assert_terminal(manager, first["job_id"])
 
@@ -266,6 +270,7 @@ class JobManagerTests(unittest.TestCase):
 
     def test_sync_execution_blocks_background_start(self) -> None:
         manager = self._manager()
+        config = self._config(max_parallel_agents=1)
         started = threading.Event()
         release = threading.Event()
         errors: list[BaseException] = []
@@ -278,7 +283,7 @@ class JobManagerTests(unittest.TestCase):
 
         def run_sync() -> None:
             try:
-                manager.run_sync("sync", self._config())
+                manager.run_sync("sync", config)
             except BaseException as error:
                 errors.append(error)
 
@@ -287,7 +292,7 @@ class JobManagerTests(unittest.TestCase):
             thread.start()
             self.assertTrue(started.wait(1.0))
             with self.assertRaises(JobBusy):
-                manager.start("background", "", self._config())
+                manager.start("background", "", config)
             release.set()
             thread.join(1.0)
 
@@ -305,10 +310,10 @@ class JobManagerTests(unittest.TestCase):
             status="running",
         )
         manager._jobs[active.job_id] = active
-        manager._active_job_id = active.job_id
+        manager._running[active.job_id] = active
 
         with self.assertRaises(JobBusy):
-            manager.start("rejected", "", self._config())
+            manager.start("rejected", "", self._config(max_parallel_agents=1))
 
         self._assert_results_retained(manager, retained)
 
@@ -435,6 +440,169 @@ class JobManagerTests(unittest.TestCase):
         job.close_messages()
         self.assertEqual(job.snapshot()["queued_messages"], 0)
         self.assertEqual(job._queued_message_bytes, 0)
+
+    def test_pool_runs_concurrent_jobs_up_to_limit(self) -> None:
+        manager = self._manager()
+        config = self._config(max_parallel_agents=2)
+        barrier = threading.Barrier(2, timeout=2.0)
+
+        def fake_run_agent(task, config, **kwargs):
+            barrier.wait()
+            return _result(task)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            first = manager.start("first", "", config)
+            second = manager.start("second", "", config)
+            self.assertTrue(manager.wait_for_terminal(first["job_id"], 2.0))
+            self.assertTrue(manager.wait_for_terminal(second["job_id"], 2.0))
+
+        self.assertEqual(manager.status(first["job_id"])["status"], "completed")
+        self.assertEqual(manager.status(second["job_id"])["status"], "completed")
+
+    def test_pool_full_rejection_lists_running_jobs(self) -> None:
+        manager = self._manager()
+        config = self._config(max_parallel_agents=2)
+        release = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            release.wait(2.0)
+            return _result(task)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            first = manager.start("first task", "", config)
+            second = manager.start("second task", "", config)
+            with self.assertRaises(JobBusy) as raised:
+                manager.start("third task", "", config)
+            release.set()
+            self.assertTrue(manager.wait_for_terminal(first["job_id"], 2.0))
+            self.assertTrue(manager.wait_for_terminal(second["job_id"], 2.0))
+
+        message = str(raised.exception)
+        self.assertIn(first["job_id"], message)
+        self.assertIn(second["job_id"], message)
+        self.assertIn("max_parallel_agents=2", message)
+
+    def test_workspace_lease_is_acquired_once_and_released_at_drain(self) -> None:
+        manager = self._manager()
+        config = self._config(max_parallel_agents=2)
+        release = threading.Event()
+        acquired: list[object] = []
+        released: list[object] = []
+        original_acquire = manager._acquire_workspace_lease_locked
+        original_release = manager._release_workspace_lease_locked
+
+        def counting_acquire(cfg):
+            lease = original_acquire(cfg)
+            acquired.append(lease)
+            return lease
+
+        def counting_release(lease):
+            released.append(lease)
+            original_release(lease)
+
+        def fake_run_agent(task, config, **kwargs):
+            release.wait(2.0)
+            return _result(task)
+
+        with (
+            patch.object(
+                manager,
+                "_acquire_workspace_lease_locked",
+                side_effect=counting_acquire,
+            ),
+            patch.object(
+                manager,
+                "_release_workspace_lease_locked",
+                side_effect=counting_release,
+            ),
+            patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent),
+        ):
+            first = manager.start("first", "", config)
+            second = manager.start("second", "", config)
+            self.assertEqual(len(acquired), 1)
+            self.assertEqual(released, [])
+            release.set()
+            self.assertTrue(manager.wait_for_terminal(first["job_id"], 2.0))
+            self.assertTrue(manager.wait_for_terminal(second["job_id"], 2.0))
+
+        self.assertEqual(len(acquired), 1)
+        self.assertEqual(len(released), 1)
+
+    def test_sync_delegation_occupies_a_pool_slot(self) -> None:
+        manager = self._manager()
+        config = self._config(max_parallel_agents=2)
+        started = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+
+        def fake_run_agent(task, config, **kwargs):
+            started.set()
+            release.wait(2.0)
+            return _result(task)
+
+        def run_sync() -> None:
+            try:
+                manager.run_sync("sync", config)
+            except BaseException as error:
+                errors.append(error)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            thread = threading.Thread(target=run_sync)
+            thread.start()
+            self.assertTrue(started.wait(1.0))
+            async_job = manager.start("async task", "", config)
+            with self.assertRaises(JobBusy):
+                manager.start("overflow", "", config)
+            release.set()
+            thread.join(1.0)
+            self.assertTrue(manager.wait_for_terminal(async_job["job_id"], 2.0))
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_job_listing_shape_filter_and_bounds(self) -> None:
+        manager = self._manager()
+        running_release = threading.Event()
+
+        def fake_run_agent(task, config, **kwargs):
+            if task.startswith("slow"):
+                running_release.wait(2.0)
+            return _result(task)
+
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            completed = manager.start("fast task", "", self._config())
+            self.assertTrue(manager.wait_for_terminal(completed["job_id"], 2.0))
+            running = manager.start("slow task " + "x" * 200, "", self._config())
+            slow_id = running["job_id"]
+            all_rows = manager.list_jobs()
+            running_rows = manager.list_jobs("running")
+
+        running_release.set()
+        self.assertTrue(manager.wait_for_terminal(slow_id, 2.0))
+
+        self.assertEqual([row["job_id"] for row in running_rows], [slow_id])
+        text = format_jobs_table(all_rows)
+        self.assertIn(TABLE_HEADER, text)
+        self.assertIn(completed["job_id"], text)
+        self.assertIn(slow_id, text)
+        self.assertIn("tokens=2", text)
+        self.assertLess(text.index(slow_id), text.index(completed["job_id"]))
+        self.assertNotIn("x" * 81, text)
+
+        for index in range(70):
+            manager._jobs[f"bulk-{index}"] = JobRecord(
+                job_id=f"bulk-{index}",
+                task="bulk",
+                context="",
+                task_length=4,
+                status="completed",
+                created_at=float(index),
+                finished_at=float(index),
+                result=_result("bulk"),
+            )
+        bounded = format_jobs_table(manager.list_jobs())
+        self.assertLessEqual(len(bounded.splitlines()), MAX_LIST_LINES)
+        self.assertIn("[truncated:", bounded)
 
 
 if __name__ == "__main__":

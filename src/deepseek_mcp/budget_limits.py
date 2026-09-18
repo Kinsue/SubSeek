@@ -65,7 +65,7 @@ def validate_budget_limit(key: str, value: object) -> int:
     return value
 
 
-def _load_optional_int_env(env_name: str) -> int | None:
+def load_optional_int_env(env_name: str) -> int | None:
     raw = os.getenv(env_name)
     if raw is None or not raw.strip():
         return None
@@ -108,7 +108,7 @@ def load_budget_limits(data: dict) -> dict:
     limits: dict = {}
     for key, env_name, default in BUDGET_LIMIT_FIELDS:
         value, present = _file_budget_value(data, key)
-        env_value = _load_optional_int_env(env_name)
+        env_value = load_optional_int_env(env_name)
         if env_value is not None:
             limits[key] = env_value
         elif present:

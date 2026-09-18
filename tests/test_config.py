@@ -199,6 +199,57 @@ class ConfigTests(unittest.TestCase):
                 ):
                     Config("credential", workspace, max_turns=value)  # type: ignore[arg-type]
 
+    def test_max_parallel_agents_default_override_and_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            self.assertEqual(
+                Config("credential", workspace).max_parallel_agents, 16
+            )
+            loaded = Config._from_data(
+                {
+                    "workspace": str(workspace),
+                    "allowed_tools": ["Read"],
+                    "max_parallel_agents": 4,
+                },
+                "credential",
+            )
+            self.assertEqual(loaded.max_parallel_agents, 4)
+            with patch.dict(
+                os.environ, {"DEEPSEEK_MAX_PARALLEL_AGENTS": "2"}, clear=True
+            ):
+                env_loaded = Config._from_data(
+                    {
+                        "workspace": str(workspace),
+                        "allowed_tools": ["Read"],
+                        "max_parallel_agents": 4,
+                    },
+                    "credential",
+                )
+            self.assertEqual(env_loaded.max_parallel_agents, 2)
+            with patch.dict(
+                os.environ, {"DEEPSEEK_MAX_PARALLEL_AGENTS": "   "}, clear=True
+            ):
+                unset = Config._from_data(
+                    {"workspace": str(workspace), "allowed_tools": ["Read"]},
+                    "credential",
+                )
+            self.assertEqual(unset.max_parallel_agents, 16)
+            for value in (True, "2", 1.5, 0, -1):
+                with self.subTest(value=value), self.assertRaisesRegex(
+                    RuntimeError, "max_parallel_agents"
+                ):
+                    Config("credential", workspace, max_parallel_agents=value)  # type: ignore[arg-type]
+            with patch.dict(
+                os.environ, {"DEEPSEEK_MAX_PARALLEL_AGENTS": "0"}, clear=True
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "DEEPSEEK_MAX_PARALLEL_AGENTS"
+                ):
+                    Config._from_data(
+                        {"workspace": str(workspace), "allowed_tools": ["Read"]},
+                        "credential",
+                    )
+
     @unittest.skipUnless(
         os.name == "posix", "requires POSIX file modes"
     )

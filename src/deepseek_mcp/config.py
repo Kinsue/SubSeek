@@ -21,6 +21,7 @@ from .budget_limits import (
     DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     DEFAULT_MAX_TOTAL_TOKENS_PER_RUN,
     load_budget_limits,
+    load_optional_int_env,
     validate_budget_cross_limits,
     validate_budget_limit,
 )
@@ -37,6 +38,7 @@ REASONING_EFFORT_OPTIONS = ("none", "low", "high", "max")
 # Kept as the active-model default for internal/backward-compatible Config construction.
 DEFAULT_MODEL = DEFAULT_FLASH_MODEL
 DEFAULT_MAX_TURNS = 50
+DEFAULT_MAX_PARALLEL_AGENTS = 16
 DEFAULT_MAX_RUN_SECONDS = 5 * 60 * 60
 HARD_MAX_RUN_SECONDS = 48 * 60 * 60
 DEFAULT_ALLOWED_TOOLS = [
@@ -64,6 +66,7 @@ CONFIG_KEYS = frozenset(
         "_reasoning_effort_options",  # installer hint only; ignored by runtime
         "max_turns",
         "max_run_seconds",
+        "max_parallel_agents",
         "allowed_tools",
         "base_url",
     }
@@ -246,6 +249,16 @@ def _load_max_turns(data: dict) -> int:
     return _validate_max_turns(data.get("max_turns", DEFAULT_MAX_TURNS))
 
 
+def _load_max_parallel_agents(data: dict) -> int:
+    env_value = load_optional_int_env("DEEPSEEK_MAX_PARALLEL_AGENTS")
+    if env_value is not None:
+        return env_value
+    return validate_budget_limit(
+        "max_parallel_agents",
+        data.get("max_parallel_agents", DEFAULT_MAX_PARALLEL_AGENTS),
+    )
+
+
 def _validate_max_run_seconds(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise RuntimeError("max_run_seconds must be an integer")
@@ -380,6 +393,7 @@ class Config:
     max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN
     max_tool_calls_per_run: int = DEFAULT_MAX_TOOL_CALLS_PER_RUN
     max_mutation_bytes_per_run: int = DEFAULT_MAX_MUTATION_BYTES_PER_RUN
+    max_parallel_agents: int = DEFAULT_MAX_PARALLEL_AGENTS
 
     def __post_init__(self) -> None:
         if is_unsafe_workspace_root(self.workspace):
@@ -402,6 +416,9 @@ class Config:
         self.base_url = _validate_base_url(self.base_url)
         self.max_turns = _validate_max_turns(self.max_turns)
         self.max_run_seconds = _validate_max_run_seconds(self.max_run_seconds)
+        self.max_parallel_agents = validate_budget_limit(
+            "max_parallel_agents", self.max_parallel_agents
+        )
         self._validate_budget_limits()
         if self.delegation_capability not in {"coding", "readonly"}:
             raise RuntimeError("invalid delegation capability")
@@ -441,6 +458,7 @@ class Config:
             max_run_seconds=_validate_max_run_seconds(
                 data.get("max_run_seconds", DEFAULT_MAX_RUN_SECONDS)
             ),
+            max_parallel_agents=_load_max_parallel_agents(data),
             allowed_tools=_load_allowed_tools(data),
             base_url=data.get("base_url", "https://api.deepseek.com"),
             flash_model=flash_model,

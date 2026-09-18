@@ -37,6 +37,7 @@ from .execution_profile import (
     CODING_PROFILE, READONLY_PROFILE, ExecutionProfile, configure_delegation,
 )
 from .host_instructions import HOST_INSTRUCTIONS as _HOST_INSTRUCTIONS
+from .job_listing import format_jobs_table
 from .job_manager import DeepSeekJobManager, JobBusy, JobError, validate_delegation_input
 from .model_selection import ModelChoice, resolve_profile
 from .private_logging import PrivateBoundedLogStream
@@ -149,10 +150,7 @@ _READONLY_AGENT_EXECUTION = ToolAnnotations(
     openWorldHint=True,
 )
 _AGENT_CONTROL = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=True,
-    idempotentHint=False,
-    openWorldHint=True,
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True,
 )
 _LOCAL_CANCELLATION = ToolAnnotations(
     readOnlyHint=False,
@@ -161,10 +159,7 @@ _LOCAL_CANCELLATION = ToolAnnotations(
     openWorldHint=False,
 )
 _RESULT_WITH_BOOKKEEPING = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=False,
-    idempotentHint=True,
-    openWorldHint=False,
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
 )
 _RECOVERY_ACK = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
@@ -402,6 +397,11 @@ def get_deepseek_status(job_id: str) -> str:
     except JobError as e:
         return _json({"ok": False, "error": str(e)})
     return _json({"ok": True, **payload})
+
+@mcp.tool(annotations=_READ_ONLY)
+def list_deepseek_jobs(status: str = "") -> str:
+    """List retained and running DeepSeek jobs as a bounded text table."""
+    return format_jobs_table(job_manager.list_jobs(status))
 
 @mcp.tool(annotations=_AGENT_CONTROL)
 def send_deepseek_message(job_id: str, message: str) -> str:

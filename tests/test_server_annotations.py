@@ -300,7 +300,7 @@ logging.getLogger("deepseek_mcp.server").warning("must-not-escape")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            config = Config("sk-test", root)
+            config = Config("sk-test", root, max_parallel_agents=1)
             manager = DeepSeekJobManager(lock_directory=root / "locks")
 
             def fake_run_agent(_task, _config, *, cancel_signal=None, **_kwargs):
@@ -570,6 +570,7 @@ server._record_usage(1, {
             "start_deepseek": (False, True, False, True),
             "start_deepseek_readonly": (True, False, False, True),
             "get_deepseek_status": (True, False, True, False),
+            "list_deepseek_jobs": (True, False, True, False),
             "send_deepseek_message": (False, True, False, True),
             "cancel_deepseek": (False, True, True, False),
             "get_deepseek_result": (False, False, True, False),

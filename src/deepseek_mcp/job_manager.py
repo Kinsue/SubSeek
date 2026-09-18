@@ -1,8 +1,9 @@
 """In-memory background job manager for steerable DeepSeek runs.
 
-Each manager has one local execution slot, and an OS lease extends exclusivity
-across processes that target the same canonical workspace. Completed background
-jobs are retained in memory for result retrieval and pruned to a bounded set.
+Each manager runs a bounded pool of local execution slots. An OS lease is held
+while any slot is occupied, extending exclusivity across processes that target
+the same canonical workspace. Completed background jobs are retained in memory
+for result retrieval and pruned to a bounded set.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from .agent_loop import (
     run_agent,
 )
 from .config import Config
+from .job_listing import full_pool_message, list_rows, prune_records, task_preview
 from .mutation_outcome import mutation_failure_message, records_from_result
 from .provider_retry import MutationOutcomeError
 from .transaction_recovery import TransactionRecoveryError, require_no_pending
@@ -63,6 +65,7 @@ class JobRecord:
     task: str
     context: str
     task_length: int
+    task_preview: str = ""
     capability: str = "coding"
     status: str = "queued"
     created_at: float = field(default_factory=time.time)
@@ -207,13 +210,13 @@ def validate_delegation_input(task: str, context: str = "") -> None:
 
 
 class DeepSeekJobManager:
-    """Thread-safe manager with one shared DeepSeek execution slot."""
+    """Thread-safe manager for a bounded pool of DeepSeek execution slots."""
 
     def __init__(self, lock_directory: Path | None = None) -> None:
         self._lock = threading.RLock()
         self._jobs: dict[str, JobRecord] = {}
-        self._active_job_id: str | None = None
-        self._sync_active = False
+        self._running: dict[str, JobRecord] = {}
+        self._lease: WorkspaceExecutionLease | None = None
         self._lock_directory = lock_directory
 
     def run_sync(
@@ -222,14 +225,26 @@ class DeepSeekJobManager:
         config: Config,
         cancel_signal: CancellationSignal | None = None,
     ) -> dict[str, Any]:
-        """Run synchronous delegation while sharing the execution slot/lease."""
+        """Run synchronous delegation while occupying one pool slot."""
         _bounded_text_bytes(
             "task", task, MAX_COMBINED_TASK_BYTES, allow_empty=False
         )
         with self._lock:
-            self._ensure_slot_available_locked()
-            lease = self._acquire_ready_workspace_lease_locked(config)
-            self._sync_active = True
+            self._ensure_capacity_locked(config)
+            self._ensure_lease_locked(config)
+            slot_id = f"sync-{uuid.uuid4().hex[:12]}"
+            self._running[slot_id] = JobRecord(
+                job_id=slot_id,
+                task=task,
+                context="",
+                task_length=len(task),
+                task_preview=task_preview(task),
+                capability=config.delegation_capability,
+                status="running",
+                started_at=time.time(),
+            )
+            lease = self._lease
+        assert lease is not None
         try:
             return run_agent(
                 task,
@@ -239,15 +254,15 @@ class DeepSeekJobManager:
             )
         finally:
             with self._lock:
-                self._release_workspace_lease_locked(lease)
-                self._sync_active = False
+                self._running.pop(slot_id, None)
+                self._release_lease_if_idle_locked()
 
     def start(self, task: str, context: str, config: Config) -> dict[str, Any]:
         validate_delegation_input(task, context)
 
         with self._lock:
-            self._ensure_slot_available_locked()
-            lease = self._acquire_ready_workspace_lease_locked(config)
+            self._ensure_capacity_locked(config)
+            self._ensure_lease_locked(config)
 
             job_id = uuid.uuid4().hex[:12]
             job = JobRecord(
@@ -255,30 +270,42 @@ class DeepSeekJobManager:
                 task=task,
                 context=context,
                 task_length=len(task),
+                task_preview=task_preview(task),
                 capability=config.delegation_capability,
+                status="running",
+                started_at=time.time(),
             )
             self._jobs[job_id] = job
-            self._active_job_id = job_id
+            self._running[job_id] = job
 
             try:
                 worker = threading.Thread(
                     target=self._run_job,
-                    args=(job_id, config, lease),
+                    args=(job_id, config),
                     name=f"deepseek-job-{job_id}",
                     daemon=True,
                 )
                 worker.start()
             except Exception as error:
                 self._jobs.pop(job_id, None)
-                if self._active_job_id == job_id:
-                    self._active_job_id = None
-                self._release_workspace_lease_locked(lease)
+                self._running.pop(job_id, None)
+                self._release_lease_if_idle_locked()
                 raise JobError("failed to start DeepSeek worker thread") from error
-            # Pruning is part of the successful-start commit. A rejected local
+            # Pruning is part of the successful-start commit. A rejected pool
             # slot, busy workspace lease, or failed thread start must not make
             # an already completed result disappear.
             self._prune_locked()
             return job.snapshot()
+
+    def list_jobs(self, status: str = "") -> list[dict[str, Any]]:
+        """Return plain listing rows for retained and running jobs."""
+        with self._lock:
+            records = list(self._jobs.values())
+            records.extend(
+                job for job_id, job in self._running.items()
+                if job_id not in self._jobs
+            )
+        return list_rows(records, status)
 
     def status(self, job_id: str) -> dict[str, Any]:
         with self._lock:
@@ -355,26 +382,14 @@ class DeepSeekJobManager:
 
     @staticmethod
     def _claim_usage_locked(job: JobRecord) -> tuple[int, dict[str, Any]] | None:
-        if (
-            job.status != "completed"
-            or not job.result
-            or job.usage_recorded
-            or job.usage_recording
-        ):
+        if job.status != "completed" or not job.result or job.usage_recorded or job.usage_recording:
             return None
         job.usage_recording = True
         return job.task_length, job.result
 
-    def _run_job(
-        self,
-        job_id: str,
-        config: Config,
-        lease: WorkspaceExecutionLease,
-    ) -> None:
+    def _run_job(self, job_id: str, config: Config) -> None:
         with self._lock:
             job = self._get_locked(job_id)
-            job.status = "running"
-            job.started_at = time.time()
             full_task = job.task
             if job.context:
                 full_task = f"{job.task}\n\n# Additional context\n{job.context}"
@@ -382,14 +397,14 @@ class DeepSeekJobManager:
             # the manager's persistent job record. Keep only a short usage summary.
             job.task = ""
             job.context = ""
-
+            lease = self._lease
+        assert lease is not None
         outcome = _run_background_agent(full_task, config, job, lease)
         self._finish_job(
             job_id,
             desired_status=outcome.status,
             result=outcome.result,
             error=outcome.error,
-            lease=lease,
             preserve_mutation_error=outcome.preserve_mutation_error,
         )
 
@@ -400,13 +415,11 @@ class DeepSeekJobManager:
         desired_status: str,
         result: dict[str, Any] | None,
         error: str | None,
-        lease: WorkspaceExecutionLease,
         preserve_mutation_error: bool = False,
     ) -> None:
         """Commit one terminal state atomically with accepted cancellation."""
         with self._lock:
             job = self._get_locked(job_id)
-            self._release_workspace_lease_locked(lease)
             cancellation_won = job.cancel_event.is_set() or desired_status == "cancelled"
             if cancellation_won:
                 _apply_cancelled_outcome(
@@ -421,9 +434,9 @@ class DeepSeekJobManager:
                 job.error = error
             job.finished_at = time.time()
             job.close_messages()
-            if self._active_job_id == job_id:
-                self._active_job_id = None
             job.finished_event.set()
+            self._running.pop(job_id, None)
+            self._release_lease_if_idle_locked()
 
     def _acquire_workspace_lease_locked(
         self,
@@ -459,18 +472,20 @@ class DeepSeekJobManager:
         except WorkspaceLockError:
             logger.exception("Failed to release workspace execution lease")
 
-    def _ensure_slot_available_locked(self) -> None:
-        if self._sync_active:
-            raise JobBusy("a synchronous DeepSeek delegation is already running")
-        if self._active_job_id is None:
+    def _ensure_capacity_locked(self, config: Config) -> None:
+        limit = config.max_parallel_agents
+        if len(self._running) >= limit:
+            raise JobBusy(full_pool_message(limit, self._running))
+
+    def _ensure_lease_locked(self, config: Config) -> None:
+        if self._lease is None:
+            self._lease = self._acquire_ready_workspace_lease_locked(config)
+
+    def _release_lease_if_idle_locked(self) -> None:
+        if self._running or self._lease is None:
             return
-        active = self._jobs.get(self._active_job_id)
-        if active and active.status not in TERMINAL_STATES:
-            raise JobBusy(
-                f"DeepSeek job {active.job_id} is already {active.status}; "
-                "finish or cancel it before starting another DeepSeek execution"
-            )
-        self._active_job_id = None
+        lease, self._lease = self._lease, None
+        self._release_workspace_lease_locked(lease)
 
     def _get_locked(self, job_id: str) -> JobRecord:
         job = self._jobs.get(job_id)
@@ -479,13 +494,4 @@ class DeepSeekJobManager:
         return job
 
     def _prune_locked(self) -> None:
-        terminal = [
-            job for job in self._jobs.values()
-            if job.status in TERMINAL_STATES and not job.usage_recording
-        ]
-        if len(terminal) < MAX_RETAINED_JOBS:
-            return
-        terminal.sort(key=lambda j: j.finished_at or j.created_at)
-        remove_count = len(terminal) - MAX_RETAINED_JOBS + 1
-        for job in terminal[:remove_count]:
-            self._jobs.pop(job.job_id, None)
+        prune_records(self._jobs, MAX_RETAINED_JOBS)
