@@ -33,7 +33,7 @@ from .agent_loop import AgentLoopCancelled, AgentLoopError
 from .token_budget import bounded_budget_message, is_budget_error, log_effective_budgets
 from .provider_retry import MutationOutcomeError, MutationOutcomeCancelled
 from .mutation_outcome import mutation_failure_message, records_from_result
-from .config import Config
+from .config import Config, apply_workspace_override
 from .execution_profile import (
     CODING_PROFILE, READONLY_PROFILE, ExecutionProfile, configure_delegation,
 )
@@ -47,6 +47,7 @@ from .transaction_recovery import (
     TransactionRecoveryError, acknowledge_with_lease,
     load_recovery_config, query_with_lease,
 )
+from .worktrees import build_tools as build_worktree_tools
 
 _VALID_MODES = frozenset({"auto", "off"})
 def _deepseek_mode() -> str:
@@ -166,6 +167,10 @@ _RECOVERY_ACK = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
 )
 
+create_deepseek_worktree, remove_deepseek_worktree = build_worktree_tools(job_manager)
+for _worktree_tool in (create_deepseek_worktree, remove_deepseek_worktree):
+    mcp.tool(annotations=_AGENT_EXECUTION)(_worktree_tool)
+
 @mcp.tool(annotations=_READ_ONLY)
 def ping() -> str:
     """Health check for the deepseek-mcp server.
@@ -226,7 +231,7 @@ def _json(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def _load_config(profile: ExecutionProfile = CODING_PROFILE, model: ModelChoice = "flash", agent: str = "") -> Config:
+def _load_config(profile: ExecutionProfile = CODING_PROFILE, model: ModelChoice = "flash", agent: str = "", workspace: str = "") -> Config:
     if _deepseek_mode() == "off":
         raise JobError("DeepSeek delegation is disabled (DEEPSEEK_MODE=off)")
     try:
@@ -236,7 +241,8 @@ def _load_config(profile: ExecutionProfile = CODING_PROFILE, model: ModelChoice 
             flash_effort=config.flash_reasoning_effort,
             pro_effort=config.pro_reasoning_effort,
         )
-        return bind_agent(config, agent, profile.capability, model)
+        bound = bind_agent(config, agent, profile.capability, model)
+        return apply_workspace_override(bound, workspace)
     except JobError:
         raise
     except Exception as e:
@@ -298,9 +304,9 @@ async def _run_sync_cancellable(full_task: str, config: Config) -> dict:
                 raise MutationOutcomeCancelled(message, tuple(records)) from None
         raise
 
-async def _delegate(task: str, context: str, profile: ExecutionProfile, model: ModelChoice, agent: str = "") -> str:
+async def _delegate(task: str, context: str, profile: ExecutionProfile, model: ModelChoice, agent: str = "", workspace: str = "") -> str:
     try:
-        config, full_task = _prepare_sync_request(task, context, profile, model, agent)
+        config, full_task = _prepare_sync_request(task, context, profile, model, agent, workspace)
     except JobError as e:
         return str(e)
     try:
@@ -326,23 +332,23 @@ async def _delegate(task: str, context: str, profile: ExecutionProfile, model: M
     _record_usage(len(task), result)
     return _format_sync_result(result)
 
-async def delegate_to_deepseek(task: str, context: str = "", model: ModelChoice = "flash", agent: str = "") -> str:
-    return await _delegate(task, context, CODING_PROFILE, model, agent)
+async def delegate_to_deepseek(task: str, context: str = "", model: ModelChoice = "flash", agent: str = "", workspace: str = "") -> str:
+    return await _delegate(task, context, CODING_PROFILE, model, agent, workspace)
 delegate_to_deepseek = register_agent_tool(mcp.tool, _AGENT_EXECUTION, "Run a full coding delegation; model arg > agent model > config default.", delegate_to_deepseek)
 
-async def delegate_to_deepseek_readonly(task: str, context: str = "", model: ModelChoice = "flash", agent: str = "") -> str:
-    return await _delegate(task, context, READONLY_PROFILE, model, agent)
+async def delegate_to_deepseek_readonly(task: str, context: str = "", model: ModelChoice = "flash", agent: str = "", workspace: str = "") -> str:
+    return await _delegate(task, context, READONLY_PROFILE, model, agent, workspace)
 delegate_to_deepseek_readonly = register_agent_tool(mcp.tool, _READONLY_AGENT_EXECUTION, "Run a read-only analysis delegation; model arg > agent model > config default.", delegate_to_deepseek_readonly)
 
 
-def _prepare_sync_request(task: str, context: str, profile: ExecutionProfile, model: ModelChoice = "flash", agent: str = "") -> tuple[Config, str]:
+def _prepare_sync_request(task: str, context: str, profile: ExecutionProfile, model: ModelChoice = "flash", agent: str = "", workspace: str = "") -> tuple[Config, str]:
     if _deepseek_mode() == "off":
         raise JobError(
             "DeepSeek delegation is disabled (DEEPSEEK_MODE=off). "
             "Continue the task yourself in the main conversation."
         )
     try:
-        config = _load_config(profile, model, agent)
+        config = _load_config(profile, model, agent, workspace)
     except JobError:
         raise
     except Exception as error:
@@ -370,20 +376,20 @@ def _log_sync_completion(result: dict) -> None:
     )
 
 
-def _start_delegation(task: str, context: str, profile: ExecutionProfile, model: ModelChoice, agent: str = "") -> str:
+def _start_delegation(task: str, context: str, profile: ExecutionProfile, model: ModelChoice, agent: str = "", workspace: str = "") -> str:
     try:
-        payload = job_manager.start(task, context, _load_config(profile, model, agent))
+        payload = job_manager.start(task, context, _load_config(profile, model, agent, workspace))
     except JobError as e:
         return _json({"ok": False, "error": str(e)})
     logger.info("Background DeepSeek job started: %s model=%s", payload["job_id"], model)
     return _json({"ok": True, **payload})
 
-def start_deepseek(task: str, context: str = "", model: ModelChoice = "flash", agent: str = "") -> str:
-    return _start_delegation(task, context, CODING_PROFILE, model, agent)
+def start_deepseek(task: str, context: str = "", model: ModelChoice = "flash", agent: str = "", workspace: str = "") -> str:
+    return _start_delegation(task, context, CODING_PROFILE, model, agent, workspace)
 start_deepseek = register_agent_tool(mcp.tool, _AGENT_EXECUTION, "Start a coding job; model arg > agent model > config default.", start_deepseek)
 
-def start_deepseek_readonly(task: str, context: str = "", model: ModelChoice = "flash", agent: str = "") -> str:
-    return _start_delegation(task, context, READONLY_PROFILE, model, agent)
+def start_deepseek_readonly(task: str, context: str = "", model: ModelChoice = "flash", agent: str = "", workspace: str = "") -> str:
+    return _start_delegation(task, context, READONLY_PROFILE, model, agent, workspace)
 start_deepseek_readonly = register_agent_tool(mcp.tool, _READONLY_AGENT_EXECUTION, "Start a read-only job; model arg > agent model > config default.", start_deepseek_readonly)
 
 @mcp.tool(annotations=_READ_ONLY)

@@ -17,6 +17,7 @@ from deepseek_mcp.config import (
     _load_api_key,
     _load_data,
     _load_workspace,
+    apply_workspace_override,
 )
 from deepseek_mcp.budget_limits import load_budget_limits
 from deepseek_mcp import windows_file_io
@@ -298,6 +299,41 @@ class ConfigTests(unittest.TestCase):
                     delegation_capability="readonly",
                     allowed_tools=["Read", "Write"],
                 )
+
+    def test_apply_workspace_override_binds_new_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base = root / "base"
+            other = root / "other"
+            base.mkdir()
+            other.mkdir()
+            config = Config("credential", base, allowed_tools=["Read"])
+
+            overridden = apply_workspace_override(config, str(other))
+
+            self.assertEqual(overridden.workspace, other.resolve())
+            self.assertNotEqual(
+                overridden.expected_workspace_identity,
+                config.expected_workspace_identity,
+            )
+            self.assertEqual(overridden.api_key, config.api_key)
+            self.assertIs(apply_workspace_override(config, ""), config)
+
+    def test_apply_workspace_override_rejects_bad_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            config = Config("credential", workspace, allowed_tools=["Read"])
+
+            with self.assertRaisesRegex(RuntimeError, "does not exist"):
+                apply_workspace_override(config, str(root / "missing"))
+            file_path = root / "file.txt"
+            file_path.write_text("x", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "not a directory"):
+                apply_workspace_override(config, str(file_path))
+            with self.assertRaisesRegex(RuntimeError, "protected|broad"):
+                apply_workspace_override(config, str(Path("/")))
 
     @unittest.skipUnless(
         os.name == "posix", "requires POSIX file modes"

@@ -70,6 +70,9 @@ class JobManagerTests(unittest.TestCase):
         self.assertTrue(manager.wait_for_terminal(job_id, 2.0))
         return manager.status(job_id)
 
+    def _mode(self, manager: DeepSeekJobManager, config: Config) -> str | None:
+        return manager._leases.mode(config.expected_workspace_identity or "")
+
     def _seed_terminal_jobs(self, manager: DeepSeekJobManager) -> list[str]:
         job_ids = []
         for index in range(MAX_RETAINED_JOBS):
@@ -599,9 +602,8 @@ class JobManagerTests(unittest.TestCase):
             slow_id = running["job_id"]
             all_rows = manager.list_jobs()
             running_rows = manager.list_jobs("running")
-
-        running_release.set()
-        self.assertTrue(manager.wait_for_terminal(slow_id, 2.0))
+            running_release.set()
+            self.assertTrue(manager.wait_for_terminal(slow_id, 2.0))
 
         self.assertEqual([row["job_id"] for row in running_rows], [slow_id])
         text = format_jobs_table(all_rows)
@@ -627,31 +629,72 @@ class JobManagerTests(unittest.TestCase):
         self.assertLessEqual(len(bounded.splitlines()), MAX_LIST_LINES)
         self.assertIn("[truncated:", bounded)
 
-    def test_workspace_change_while_pool_running_is_rejected(self) -> None:
+    def test_parallel_coding_jobs_on_distinct_workspaces_run_concurrently(self) -> None:
         manager = self._manager()
+        release = threading.Event()
+        barrier = threading.Barrier(2, timeout=2.0)
+
+        def fake_run_agent(task, config, **kwargs):
+            barrier.wait()
+            release.wait(2.0)
+            return _result(task)
+
+        other = self.workspace.parent / "other"
+        other.mkdir()
+        config_a = self._config(max_parallel_agents=2)
+        config_b = self._config(other, max_parallel_agents=2)
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            first = manager.start("first", "", config_a)
+            second = manager.start("second", "", config_b)
+            self.assertEqual(self._mode(manager, config_a), LEASE_EXCLUSIVE)
+            self.assertEqual(self._mode(manager, config_b), LEASE_EXCLUSIVE)
+            release.set()
+            self._assert_terminal(manager, first["job_id"])
+            self._assert_terminal(manager, second["job_id"])
+
+        self.assertTrue(manager._leases.is_idle())
+
+    def test_same_workspace_coding_conflicts_beyond_capacity(self) -> None:
+        manager = self._manager()
+        config = self._config(max_parallel_agents=4)
         release = threading.Event()
 
         def fake_run_agent(task, config, **kwargs):
             release.wait(2.0)
             return _result(task)
 
-        other = self.workspace.parent / "other"
-        other.mkdir()
-        config_a = self._config(delegation_capability="readonly")
-        config_b = self._config(other, delegation_capability="readonly")
         with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
-            first = manager.start("first", "", config_a)
-            with self.assertRaisesRegex(JobError, "workspace") as raised:
-                manager.start("second", "", config_b)
-            message = str(raised.exception)
-            self.assertIn(config_a.expected_workspace_identity, message)
-            self.assertIn(config_b.expected_workspace_identity, message)
-            with self.assertRaisesRegex(JobError, "workspace"):
-                manager.run_sync("second", config_b)
-            same_workspace = manager.start("third", "", config_a)
+            first = manager.start("write a", "", config)
+            with self.assertRaises(JobBusy) as raised:
+                manager.start("write b", "", config)
             release.set()
             self._assert_terminal(manager, first["job_id"])
-            self._assert_terminal(manager, same_workspace["job_id"])
+
+        self.assertIn("exclusive workspace lease", str(raised.exception))
+
+    def test_per_workspace_drain_keeps_other_lease_held(self) -> None:
+        manager = self._manager()
+        other = self.workspace.parent / "other"
+        other.mkdir()
+        releases = {True: threading.Event(), False: threading.Event()}
+
+        def fake_run_agent(task, config, **kwargs):
+            releases[task == "a"].wait(2.0)
+            return _result(task)
+
+        config_a = self._config(max_parallel_agents=2)
+        config_b = self._config(other, max_parallel_agents=2)
+        with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
+            first = manager.start("a", "", config_a)
+            second = manager.start("b", "", config_b)
+            releases[True].set()
+            self._assert_terminal(manager, first["job_id"])
+            self.assertIsNone(self._mode(manager, config_a))
+            self.assertEqual(self._mode(manager, config_b), LEASE_EXCLUSIVE)
+            releases[False].set()
+            self._assert_terminal(manager, second["job_id"])
+
+        self.assertTrue(manager._leases.is_idle())
 
     def test_admission_rechecks_pending_transactions_with_cached_lease(self) -> None:
         manager = self._manager()
@@ -666,7 +709,7 @@ class JobManagerTests(unittest.TestCase):
 
         with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
             first = manager.start("first", "", config)
-            self.assertEqual(manager._lease_mode, LEASE_SHARED)
+            self.assertEqual(self._mode(manager, config), LEASE_SHARED)
             with patch(
                 "deepseek_mcp.job_manager.require_no_pending",
                 side_effect=TransactionRecoveryError("unacknowledged transactions"),
@@ -691,9 +734,7 @@ class JobManagerTests(unittest.TestCase):
                 manager.run_sync("fail", config)
 
         self.assertEqual(manager._running, {})
-        self.assertIsNone(manager._lease)
-        self.assertIsNone(manager._lease_identity)
-        self.assertIsNone(manager._lease_mode)
+        self.assertTrue(manager._leases.is_idle())
 
         with patch("deepseek_mcp.job_manager.run_agent", return_value=_result()):
             job = manager.start("after", "", config)
@@ -718,9 +759,7 @@ class JobManagerTests(unittest.TestCase):
 
         self.assertEqual(status["status"], "cancelled")
         self.assertEqual(manager._running, {})
-        self.assertIsNone(manager._lease)
-        self.assertIsNone(manager._lease_identity)
-        self.assertIsNone(manager._lease_mode)
+        self.assertTrue(manager._leases.is_idle())
 
     def test_full_pool_message_is_bounded(self) -> None:
         class _Rec:
@@ -835,24 +874,24 @@ class JobManagerTests(unittest.TestCase):
 
         with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
             first = manager.start("read", "", readonly)
-            self.assertEqual(manager._lease_mode, LEASE_SHARED)
+            self.assertEqual(self._mode(manager, readonly), LEASE_SHARED)
             release.set()
             self._assert_terminal(manager, first["job_id"])
-            self.assertIsNone(manager._lease_mode)
+            self.assertIsNone(self._mode(manager, readonly))
 
             release.clear()
             second = manager.start("write", "", coding)
-            self.assertEqual(manager._lease_mode, LEASE_EXCLUSIVE)
+            self.assertEqual(self._mode(manager, coding), LEASE_EXCLUSIVE)
             release.set()
             self._assert_terminal(manager, second["job_id"])
-            self.assertIsNone(manager._lease_mode)
+            self.assertIsNone(self._mode(manager, coding))
 
             release.clear()
             third = manager.start("read again", "", readonly)
-            self.assertEqual(manager._lease_mode, LEASE_SHARED)
+            self.assertEqual(self._mode(manager, readonly), LEASE_SHARED)
             release.set()
             self._assert_terminal(manager, third["job_id"])
-            self.assertIsNone(manager._lease_mode)
+            self.assertIsNone(self._mode(manager, readonly))
 
     def test_readonly_leases_coexist_across_managers_but_exclude_coding(self) -> None:
         first = self._manager()
@@ -888,6 +927,20 @@ class JobManagerTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["agent"], "reviewer")
         self.assertIn("agent=reviewer", format_jobs_table(rows))
+
+    def test_job_listing_reports_workspace_label(self) -> None:
+        manager = self._manager()
+        other = self.workspace.parent / "review-wt"
+        other.mkdir()
+        config = self._config(other)
+
+        with patch("deepseek_mcp.job_manager.run_agent", return_value=_result()):
+            job = manager.start("review task", "", config)
+            self._assert_terminal(manager, job["job_id"])
+            rows = manager.list_jobs()
+
+        self.assertEqual(rows[0]["workspace"], "review-wt")
+        self.assertIn("workspace=review-wt", format_jobs_table(rows))
 
     def test_blocked_listing_includes_agent_id(self) -> None:
         manager = self._manager()
@@ -927,11 +980,11 @@ class JobManagerTests(unittest.TestCase):
 
         with patch("deepseek_mcp.job_manager.run_agent", side_effect=fake_run_agent):
             job = manager.start("mutate", "", config)
-            self.assertEqual(manager._lease_mode, LEASE_EXCLUSIVE)
+            self.assertEqual(self._mode(manager, config), LEASE_EXCLUSIVE)
             release.set()
             self._assert_terminal(manager, job["job_id"])
 
-        self.assertIsNone(manager._lease_mode)
+        self.assertIsNone(self._mode(manager, config))
 
 
 if __name__ == "__main__":

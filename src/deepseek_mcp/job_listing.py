@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 TASK_PREVIEW_CHARS = 80
+WORKSPACE_LABEL_CHARS = 40
 MAX_LIST_LINES = 64
 MAX_LIST_ROWS = MAX_LIST_LINES - 2
-TABLE_HEADER = "job_id | status | capability | agent | task | started | age_s | tokens"
+TABLE_HEADER = (
+    "job_id | status | capability | agent | workspace | task | started | age_s | tokens"
+)
 LEASE_SHARED = "shared"
 LEASE_EXCLUSIVE = "exclusive"
 
@@ -25,6 +29,15 @@ def task_preview(task: object) -> str:
     if not isinstance(task, str):
         return ""
     return " ".join(task.split())[:TASK_PREVIEW_CHARS]
+
+
+def workspace_label(workspace: object) -> str:
+    """Return a bounded, host-visible label for one workspace path."""
+    if not isinstance(workspace, (str, Path)):
+        return ""
+    text = str(workspace)
+    name = Path(text).name
+    return (name or text)[:WORKSPACE_LABEL_CHARS]
 
 
 def _preview_of(job: object) -> str:
@@ -37,6 +50,11 @@ def _agent_of(job: object) -> str:
     if isinstance(agent, str) and agent:
         return agent
     return str(getattr(job, "capability", "coding"))
+
+
+def _workspace_of(job: object) -> str:
+    label = getattr(job, "workspace", "")
+    return label if isinstance(label, str) and label else "-"
 
 
 def _sync_marker(job_id: object) -> str:
@@ -65,6 +83,7 @@ def row_from_job(job: object) -> dict[str, Any]:
         "status": getattr(job, "status", "queued"),
         "capability": getattr(job, "capability", "coding"),
         "agent": _agent_of(job),
+        "workspace": _workspace_of(job),
         "task_preview": _preview_of(job),
         "created_at": getattr(job, "created_at", 0.0) or 0.0,
         "started_at": getattr(job, "started_at", None),
@@ -86,7 +105,7 @@ def _pool_line(job_id: str, job: object) -> str:
     return (
         f"{job_id}{_sync_marker(job_id)} {getattr(job, 'status', 'running')} "
         f"{getattr(job, 'capability', 'coding')} agent={_agent_of(job)} "
-        f"{_preview_of(job)}"
+        f"workspace={_workspace_of(job)} {_preview_of(job)}"
     )
 
 
@@ -153,8 +172,8 @@ def _format_row(row: dict[str, Any], now: float) -> str:
     marker = " (sync)" if row.get("sync") else ""
     return (
         f"{row['job_id']}{marker} | {row['status']} | {row['capability']} | "
-        f"agent={row['agent']} | {row['task_preview']} | "
-        f"{_started_iso(row['started_at'])} | "
+        f"agent={row['agent']} | workspace={row['workspace']} | "
+        f"{row['task_preview']} | {_started_iso(row['started_at'])} | "
         f"{_age_seconds(now, row['started_at'])} | {token_text}"
     )
 

@@ -577,6 +577,8 @@ server._record_usage(1, {
             "get_deepseek_result": (False, False, True, False),
             "get_deepseek_recovery": (False, False, True, False),
             "acknowledge_deepseek_mutations": (False, True, True, False),
+            "create_deepseek_worktree": (False, True, False, True),
+            "remove_deepseek_worktree": (False, True, False, True),
         }
 
         self.assertEqual(set(tools), set(expected))
@@ -631,6 +633,11 @@ server._record_usage(1, {
                             "title": "Agent",
                             "type": "string",
                         },
+                        "workspace": {
+                            "default": "",
+                            "title": "Workspace",
+                            "type": "string",
+                        },
                     },
                     "required": ["task"],
                     "title": f"{name}Arguments",
@@ -679,6 +686,30 @@ server._record_usage(1, {
                 server._load_config(server.CODING_PROFILE, "flash", "ghost")
             with self.assertRaisesRegex(server.JobError, "capability"):
                 server._load_config(server.CODING_PROFILE, "flash", "reviewer")
+
+    def test_workspace_argument_binds_per_call_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            other = Path(tmpdir) / "other"
+            other.mkdir()
+            config = Config("sk-test", ROOT, allowed_tools=["Read"])
+            with patch.object(server.Config, "load", return_value=config):
+                loaded = server._load_config(
+                    server.READONLY_PROFILE, "flash", "", str(other)
+                )
+
+        self.assertEqual(loaded.workspace, other.resolve())
+        self.assertNotEqual(
+            loaded.expected_workspace_identity,
+            config.expected_workspace_identity,
+        )
+
+    def test_invalid_workspace_argument_is_transparent(self) -> None:
+        config = Config("sk-test", ROOT, allowed_tools=["Read"])
+        with patch.object(server.Config, "load", return_value=config):
+            with self.assertRaisesRegex(server.JobError, "does not exist"):
+                server._load_config(
+                    server.READONLY_PROFILE, "flash", "", "/nonexistent-ws"
+                )
 
 
 if __name__ == "__main__":

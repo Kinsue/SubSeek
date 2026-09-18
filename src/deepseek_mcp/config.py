@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import stat
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -234,6 +234,20 @@ def _load_workspace(data: dict) -> Path:
             "agent-control, or broad ancestor directory"
         )
     return candidate
+
+
+def apply_workspace_override(config: "Config", workspace: str) -> "Config":
+    """Return a config bound to an explicit per-call workspace, or the same one.
+
+    The override goes through the same resolution and safety checks as the
+    configured workspace; the workspace identity is recomputed.
+    """
+    if not workspace:
+        return config
+    if not isinstance(workspace, str) or not workspace.strip():
+        raise RuntimeError("workspace must be a non-empty string or empty for default")
+    resolved = _load_workspace({"workspace": workspace})
+    return replace(config, workspace=resolved, expected_workspace_identity=None)
 
 
 def _validate_max_turns(value: object) -> int:

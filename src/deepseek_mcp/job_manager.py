@@ -25,19 +25,18 @@ from .agent_loop import (
 from .agent_catalog import MUTATION_TOOLS
 from .config import Config
 from .job_listing import (
-    LEASE_EXCLUSIVE,
-    LEASE_SHARED,
     full_pool_message,
     lease_conflict_message,
     list_rows,
     prune_records,
     task_preview,
+    workspace_label,
 )
 from .job_outcomes import (
     JobOutcome,
     apply_cancelled_outcome,
-    workspace_mismatch_message,
 )
+from .lease_registry import LeaseRegistry
 from .provider_retry import MutationOutcomeError
 from .transaction_recovery import TransactionRecoveryError, require_no_pending
 from .execution_lock import (
@@ -80,6 +79,8 @@ class JobRecord:
     task_preview: str = ""
     capability: str = "coding"
     agent: str = "coding"
+    workspace: str = ""
+    workspace_identity: str = ""
     status: str = "queued"
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -103,6 +104,7 @@ class JobRecord:
             "job_id": self.job_id,
             "capability": self.capability,
             "agent": self.agent,
+            "workspace": self.workspace,
             "status": self.status,
             "cancel_requested": self.cancel_event.is_set(),
             "accepting_messages": accepting_messages,
@@ -206,8 +208,10 @@ def _new_record(job_id: str, task: str, context: str, config: Config) -> JobReco
     return JobRecord(
         job_id=job_id, task=task, context=context, task_length=len(task),
         task_preview=task_preview(task), capability=config.delegation_capability,
-        agent=config.active_agent or config.delegation_capability, status="running",
-        started_at=time.time(),
+        agent=config.active_agent or config.delegation_capability,
+        workspace=workspace_label(config.workspace),
+        workspace_identity=config.expected_workspace_identity or "",
+        status="running", started_at=time.time(),
     )
 
 
@@ -218,9 +222,7 @@ class DeepSeekJobManager:
         self._lock = threading.RLock()
         self._jobs: dict[str, JobRecord] = {}
         self._running: dict[str, JobRecord] = {}
-        self._lease: WorkspaceExecutionLease | None = None
-        self._lease_identity: str | None = None
-        self._lease_mode: str | None = None
+        self._leases = LeaseRegistry()
         self._lock_directory = lock_directory
 
     def run_sync(
@@ -233,13 +235,10 @@ class DeepSeekJobManager:
         )
         with self._lock:
             self._ensure_capacity_locked(config)
-            self._ensure_lease_locked(config)
+            lease = self._admit_locked(config)
             slot_id = f"sync-{uuid.uuid4().hex[:12]}"
-            self._running[slot_id] = _new_record(slot_id, task, "", config)
-            lease = self._lease
-            if lease is None:
-                self._running.pop(slot_id, None)
-                raise JobError("workspace execution lease is unavailable")
+            slot = _new_record(slot_id, task, "", config)
+            self._running[slot_id] = slot
         try:
             return run_agent(
                 task,
@@ -250,14 +249,16 @@ class DeepSeekJobManager:
         finally:
             with self._lock:
                 self._running.pop(slot_id, None)
-                self._release_lease_if_idle_locked()
+                self._leases.release(
+                    slot.workspace_identity, self._release_workspace_lease_locked
+                )
 
     def start(self, task: str, context: str, config: Config) -> dict[str, Any]:
         validate_delegation_input(task, context)
 
         with self._lock:
             self._ensure_capacity_locked(config)
-            self._ensure_lease_locked(config)
+            self._admit_locked(config)
 
             job_id = uuid.uuid4().hex[:12]
             job = _new_record(job_id, task, context, config)
@@ -275,13 +276,20 @@ class DeepSeekJobManager:
             except Exception as error:
                 self._jobs.pop(job_id, None)
                 self._running.pop(job_id, None)
-                self._release_lease_if_idle_locked()
+                self._leases.release(
+                    job.workspace_identity, self._release_workspace_lease_locked
+                )
                 raise JobError("failed to start DeepSeek worker thread") from error
             # Pruning is part of the successful-start commit. A rejected pool
             # slot, busy workspace lease, or failed thread start must not make
             # an already completed result disappear.
             self._prune_locked()
             return job.snapshot()
+
+    def identity_is_busy(self, identity: str) -> bool:
+        """Return whether any running job currently holds this workspace lease."""
+        with self._lock:
+            return self._leases.running_count(identity) > 0
 
     def list_jobs(self, status: str = "") -> list[dict[str, Any]]:
         """Return plain listing rows for retained and running jobs."""
@@ -385,7 +393,7 @@ class DeepSeekJobManager:
                 # task_preview (80 chars, same-host visibility only).
                 job.task = ""
                 job.context = ""
-                lease = self._lease
+                lease = self._leases.lease_for(job.workspace_identity)
             if lease is None:
                 raise JobError("workspace execution lease is unavailable")
             outcome = _run_background_agent(full_task, config, job, lease)
@@ -420,7 +428,9 @@ class DeepSeekJobManager:
             job.close_messages()
             job.finished_event.set()
             self._running.pop(job_id, None)
-            self._release_lease_if_idle_locked()
+            self._leases.release(
+                job.workspace_identity, self._release_workspace_lease_locked
+            )
 
     def _acquire_workspace_lease_locked(
         self,
@@ -440,17 +450,6 @@ class DeepSeekJobManager:
         except WorkspaceLockError as error:
             raise JobError(str(error)) from error
 
-    def _acquire_ready_workspace_lease_locked(
-        self, config: Config, shared: bool = False,
-    ) -> WorkspaceExecutionLease:
-        lease = self._acquire_workspace_lease_locked(config, shared)
-        try:
-            require_no_pending(config)
-        except TransactionRecoveryError as error:
-            self._release_workspace_lease_locked(lease)
-            raise JobError(str(error)) from None
-        return lease
-
     @staticmethod
     def _release_workspace_lease_locked(lease: WorkspaceExecutionLease) -> None:
         try:
@@ -462,32 +461,32 @@ class DeepSeekJobManager:
         if len(self._running) >= config.max_parallel_agents:
             raise JobBusy(full_pool_message(config.max_parallel_agents, self._running))
 
-    def _ensure_lease_locked(self, config: Config) -> None:
-        identity = config.expected_workspace_identity
-        capability = config.delegation_capability
-        if self._lease is None:
-            shared = capability != "coding" and not MUTATION_TOOLS.intersection(config.allowed_tools)
-            self._lease = self._acquire_ready_workspace_lease_locked(config, shared)
-            self._lease_identity = identity
-            self._lease_mode = LEASE_SHARED if shared else LEASE_EXCLUSIVE
-            return
-        if identity != self._lease_identity:
-            raise JobError(workspace_mismatch_message(self._lease_identity, identity))
+    def _admit_locked(self, config: Config) -> WorkspaceExecutionLease:
+        """Admit one job against its target workspace identity, returning its lease."""
+        identity = config.expected_workspace_identity or ""
+        mode = self._leases.mode(identity)
+        if mode is not None:
+            running = {
+                job_id: job for job_id, job in self._running.items()
+                if job.workspace_identity == identity
+            }
+            conflict = lease_conflict_message(
+                running, mode, config.delegation_capability
+            )
+            if conflict is not None:
+                raise JobBusy(conflict)
+        shared = config.delegation_capability != "coding" and not MUTATION_TOOLS.intersection(
+            config.allowed_tools
+        )
         try:
-            require_no_pending(config)
+            return self._leases.acquire(
+                identity, config, shared,
+                self._acquire_workspace_lease_locked,
+                require_no_pending,
+                self._release_workspace_lease_locked,
+            )
         except TransactionRecoveryError as error:
             raise JobError(str(error)) from None
-        conflict = lease_conflict_message(self._running, self._lease_mode, capability)
-        if conflict is not None:
-            raise JobBusy(conflict)
-
-    def _release_lease_if_idle_locked(self) -> None:
-        if self._running or self._lease is None:
-            return
-        lease, self._lease = self._lease, None
-        self._lease_identity = None
-        self._lease_mode = None
-        self._release_workspace_lease_locked(lease)
 
     def _get_locked(self, job_id: str) -> JobRecord:
         job = self._jobs.get(job_id)
