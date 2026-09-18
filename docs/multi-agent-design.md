@@ -15,24 +15,54 @@ remains available as an opt-in.
   (same as readonly). Exclusive admission disappears; cross-process parallel
   writers on one workspace are admitted. The lease survives as the liveness
   anchor and for the worktree-remove EX probe (still refuses while any job
-  holds SH on that identity).
-- **Recovery semantics**: admission is no longer hard-blocked by pending
-  mutation transactions. The journal gains job attribution on records
-  (job_id + agent); `get_deepseek_recovery` works while jobs are running
-  (internal journal flock only — no exclusive workspace lease acquisition)
-  and groups pending records by job. Results carry a pending-recovery notice
-  when unacknowledged records exist at completion.
+  holds SH on that identity). The P3a mutation-tools-force-EX hardening
+  applies ONLY in exclusive mode — in allow mode every coding toolset
+  contains mutation tools, so keeping the clause unconditionally would
+  nullify the phase.
+- **Recovery semantics** (amended per design gate):
+  - Journal records gain job attribution: `job_id`, `agent`, `started_at`
+    (pid optional). The job_id reaches the tool-child journal write path via
+    the tool settings payload (the same channel as `delegation_capability`),
+    including the sync path.
+  - Admission is no longer hard-blocked by pending mutation transactions.
+  - `get_deepseek_recovery` runs under the internal journal flock only (no
+    workspace-lease acquisition), groups pending records by job, and
+    annotates each group with the job's current status resolved from the
+    live manager; unresolvable ids (restarted server) and `sync-*` ids
+    annotate as terminal-unknown.
+  - `acknowledge_deepseek_mutations` runs under the internal journal flock
+    only and REJECTS ids belonging to still-running jobs — acknowledging a
+    live writer's intents races its outcome report. This running-job guard
+    replaces the lease as the safety mechanism.
+- **Pending-recovery signals at admission/listing level** (not only in
+  results): the coding admission response on an identity with pending
+  records carries a non-blocking pending-recovery summary (counts by job);
+  `list_deepseek_jobs` badges identities with unacknowledged records. A
+  crashed background job whose result is never polled must still be visible.
 - **Advisory layer**: the coding child system prompt gains a concurrency
-  advisory (scope edits to the task, avoid unrelated files, other agents may
-  be editing concurrently). When a second coding job is admitted on an
-  identity that already has one, the admission result includes a host-facing
-  overlap notice suggesting disjoint scopes or worktrees.
+  advisory including edit-conflict retry semantics — when an Edit fails its
+  expected-identity check because another writer changed the file, re-read
+  and re-apply; never force or loop blindly. The overlap notice is
+  admission-response-only (transient, never stored on JobRecord) and
+  carries the existing job's id, agent, and task preview plus the worktree
+  suggestion.
 - **Config**: `same_workspace_writers: "allow" (default) | "exclusive"`.
-  `"exclusive"` restores the P2/P3 single-writer-per-workspace behavior
-  (EX lease for coding, pending-recovery admission gate). Mode is per
-  process; cross-process contention still fails closed via flock.
+  `"exclusive"` restores the P2/P3 single-writer-per-workspace behavior (EX
+  lease for coding, pending-recovery admission gate, mutation-tools
+  hardening). Mode is per process; flock arbitrates cross-mode contention
+  fail-closed; an exclusive-mode process may starve under continuous SH
+  churn (documented best-effort, consistent with reject-with-listing).
+- **Journal capacity**: the 128-records-per-identity ceiling is reached much
+  faster with N writers and host-delayed acknowledgement; recovery and
+  admission payloads warn at >=96 pending records and docs state the
+  host's obligation to acknowledge promptly in allow mode.
+- **Windows**: allow mode grants in-process parallelism only (exclusive-open
+  lease semantics); cross-process sharing stays POSIX-only.
 - **Unchanged**: pool/capacity, budgets, agent catalog, worktree tools,
   readonly semantics, list tool, readonly-agents-cannot-mutate rule.
+- **Release note obligation**: the default flip changes behavior for hosts
+  that relied on JobBusy-induced serialization of fanned-out coding tasks —
+  flag loudly in release notes.
 
 
 ## Goals
@@ -85,7 +115,7 @@ sub-agents.
 | Decision | Choice |
 |---|---|
 | Pool-full policy | Reject immediately; error lists running jobs (id/status/capability/task preview). No queue. |
-| Same-workspace parallel writers | Forbidden by default (exclusive lease stays). Parallel coding work goes through per-job worktrees (P3). No escape hatch key. |
+| Same-workspace parallel writers | P3: forbidden by default. P4 (supersedes): allowed by default (shared lease, advisory prompts + git); `same_workspace_writers=exclusive` restores single-writer; worktrees remain the guaranteed-isolation path. |
 | Concurrency | `max_parallel_agents` default **16**, positive integer, **no upper bound** (provider is the authority for its own limits). |
 
 ## Architecture
