@@ -103,7 +103,7 @@ result back. Token savings are end-to-end.
 - **Fixed capability APIs**: coding gets Read / Write / Edit / Bash / Glob / Grep / NotebookEdit; read-only gets Read / Glob / Grep
 - **Bash execution**: bounded credential-isolated trusted-host commands through the tool-child boundary
 - **Workspace path boundary** for file tools, with outbound symlinks rejected
-- **Cross-process execution lease** so two MCP servers cannot run DeepSeek concurrently against the same workspace
+- **Cross-process execution lease** so at most one coding execution runs against the same workspace at a time; readonly executions may share a lease and run in parallel (POSIX)
 - **Crash-safe mutation journal for Write / Edit / NotebookEdit** with recovery query, file verification, and exact acknowledgement before another delegation; trusted-host Bash changes are not journaled
 - **Explicit network retry policy** with OpenAI SDK internal retries disabled to avoid nested retry amplification in proxy/TLS-timeout environments
 - **Claude Code skill + `/ds` command** for delegation policy and forced delegation
@@ -206,7 +206,7 @@ the existing readonly job.
 
 If a steering message arrives after DeepSeek has planned tool calls but before a not-yet-executed tool runs, the stale tool call is skipped and DeepSeek re-plans from the new parent instruction.
 
-Only **one DeepSeek execution per canonical workspace** may run at a time, including executions started by separate MCP server processes. This lease coordinates DeepSeek MCP executions only; it cannot prevent the host agent, IDE, user, or another local process from changing the workspace. While a coding background job is running, the host should steer, query, or cancel that job rather than independently mutate the same workspace, then resume host-side edits after the job reaches a terminal state. Background job IDs and results are session-scoped; collect the result before closing the host session.
+At most one **coding** DeepSeek execution per canonical workspace may run at a time — including executions started by separate MCP server processes — while readonly executions may share a lease and run in parallel (POSIX). This lease coordinates DeepSeek MCP executions only; it cannot prevent the host agent, IDE, user, or another local process from changing the workspace. While a coding background job is running, the host should steer, query, or cancel that job rather than independently mutate the same workspace, then resume host-side edits after the job reaches a terminal state. Background job IDs and results are session-scoped; collect the result before closing the host session.
 
 ### Mutation recovery
 

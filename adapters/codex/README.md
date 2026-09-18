@@ -148,8 +148,9 @@ and promptly terminates an in-flight provider or local-tool subprocess. A
 cancellation accepted before terminal commit always wins that atomic commit; a
 later request returns `cancel_accepted=false`.
 
-An OS-backed lease permits one DeepSeek execution per canonical workspace even
-when several Codex/MCP processes exist. Different workspaces can run
+An OS-backed lease permits at most one coding execution per canonical
+workspace even when several Codex/MCP processes exist; readonly executions
+may share a lease (POSIX). Different workspaces can run
 independently. Background job state is held in the current MCP process only:
 collect its result before closing or restarting the Codex task.
 
