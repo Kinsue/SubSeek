@@ -61,9 +61,6 @@ class ProviderContractTests(unittest.TestCase):
             mutation_budget=MutationBudget(),
             tool_calls=0,
             deadline=time.monotonic() + 30,
-            prompt_tokens=0,
-            completion_tokens=0,
-            budget_tokens=0,
             mutations=SimpleNamespace(add=lambda _record: None),
         )
 

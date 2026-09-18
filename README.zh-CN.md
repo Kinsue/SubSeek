@@ -278,6 +278,9 @@ max_retries=0
 }
 ```
 
+可选的预算键约束单次运行的 token、工具调用与写入字节；
+见[预算](#预算)。
+
 `flash` 和 `pro` 是两个稳定 MCP 路由槽位背后的真实 provider 模型名。DeepSeek 后续升级
 到新版本，或者兼容 API 端点使用不同模型名时，用户只需要修改这里的字符串，不需要改变
 Claude/Codex 的 MCP 调用方式；公共参数始终只传 `model="flash"` 或 `model="pro"`。
@@ -319,7 +322,7 @@ token 记账基于 provider 用量：运行预算按最近一次请求上报的 
 加累计 completion_tokens 计算，长会话不会再提前触发预算。首次 provider
 响应之前、以及历史检查在下一响应到来之前，会按消息字节数保守估算
 （约 4 字节/token）；接近上限的密集内容任务仍可能被 provider 拒绝而不是
-在本地拦截。12 MiB 的原始请求字节传输守卫保持内部固定不变。
+在本地拦截。对编码后的会话历史仍保留 12 MiB 的内部固定守卫。
 
 跨键规则：`max_output_tokens_per_request` 不得超过 `max_total_tokens_per_run`，
 `max_tool_calls_per_turn` 不得超过 `max_tool_calls_per_run`。

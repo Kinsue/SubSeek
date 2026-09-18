@@ -282,6 +282,9 @@ No third-party proxy or cloud relay is introduced by this project. Delegated pro
 }
 ```
 
+Optional budget keys bound tokens, tool calls, and mutation bytes per run;
+see [Budgets](#budgets).
+
 `flash` and `pro` are the provider model IDs behind the two stable MCP routing
 profiles. You can change these strings when DeepSeek publishes a new model
 revision, or when a compatible endpoint uses different model names, without
@@ -333,7 +336,7 @@ sessions no longer trip the budget early. Before the first provider response —
 and for the history check until the next response arrives — sizes are
 conservatively estimated from message bytes (~4 bytes/token), so dense-content
 tasks near the caps may still be rejected by the provider rather than locally.
-A 12 MiB transport guard on raw request bytes remains internal and fixed.
+A 12 MiB internal guard on the encoded conversation history remains fixed.
 
 Cross-key rules: `max_output_tokens_per_request` must not exceed
 `max_total_tokens_per_run`, and `max_tool_calls_per_turn` must not exceed
