@@ -1,7 +1,39 @@
 # Multi-Agent Parallelism Design
 
 Status: accepted (owner decisions 2026-09-18) · Phases: P1 scheduler + work
-list → P2 read/write lock split → P3 agent catalog + worktree isolation.
+list → P2 read/write lock split → P3 agent catalog + worktree isolation →
+P4 same-workspace parallel writers (mainstream alignment).
+
+## P4 — Same-workspace parallel writers (owner decision, opencode-aligned)
+
+Owner choice: align with the mainstream model (opencode / Claude Code
+subagents) — same-workspace concurrent CODING jobs are allowed; safety comes
+from advisory prompts + git, not mutual exclusion. The strict P2/P3 behavior
+remains available as an opt-in.
+
+- **Lease model**: coding jobs take the SHARED lease per workspace identity
+  (same as readonly). Exclusive admission disappears; cross-process parallel
+  writers on one workspace are admitted. The lease survives as the liveness
+  anchor and for the worktree-remove EX probe (still refuses while any job
+  holds SH on that identity).
+- **Recovery semantics**: admission is no longer hard-blocked by pending
+  mutation transactions. The journal gains job attribution on records
+  (job_id + agent); `get_deepseek_recovery` works while jobs are running
+  (internal journal flock only — no exclusive workspace lease acquisition)
+  and groups pending records by job. Results carry a pending-recovery notice
+  when unacknowledged records exist at completion.
+- **Advisory layer**: the coding child system prompt gains a concurrency
+  advisory (scope edits to the task, avoid unrelated files, other agents may
+  be editing concurrently). When a second coding job is admitted on an
+  identity that already has one, the admission result includes a host-facing
+  overlap notice suggesting disjoint scopes or worktrees.
+- **Config**: `same_workspace_writers: "allow" (default) | "exclusive"`.
+  `"exclusive"` restores the P2/P3 single-writer-per-workspace behavior
+  (EX lease for coding, pending-recovery admission gate). Mode is per
+  process; cross-process contention still fails closed via flock.
+- **Unchanged**: pool/capacity, budgets, agent catalog, worktree tools,
+  readonly semantics, list tool, readonly-agents-cannot-mutate rule.
+
 
 ## Goals
 
